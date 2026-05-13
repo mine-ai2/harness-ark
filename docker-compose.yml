@@ -1,0 +1,11 @@
+services:
+  ark:
+    build: .
+    container_name: ark
+    volumes:
+      - .:/app
+      - ./.ark-home:/root/.ark
+    ports:
+      - "127.0.0.1:7777:7777"
+    stdin_open: true
+    tty: true

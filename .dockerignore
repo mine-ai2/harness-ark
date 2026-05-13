@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ark-home
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+tests
+design

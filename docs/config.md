@@ -1,0 +1,238 @@
+# Configuring Ark
+
+Ark reads one JSON file at startup: `~/.ark/config.json` (or wherever
+`ARK_HOME` points). Everything that isn't agent runtime state — sessions,
+schedules, skills — lives here.
+
+The file is loaded once per server start; a restart is required to pick up
+edits. Schedules (heartbeats, crons) and loaded skills are *not* in this
+file — they live in the database and are managed at runtime (see
+[docs/deploy.md](deploy.md) for backup semantics).
+
+## Top-level shape
+
+```json
+{
+  "server":    { ... },
+  "providers": { "<name>": { ... }, ... },
+  "tools":     { "<name>": { ... }, ... },
+  "agents":    { "<name>": { ... }, ... }
+}
+```
+
+| Section | Required | What it configures |
+|---|---|---|
+| `server` | yes | HTTP/WS listener and the bearer token |
+| `providers` | yes | LLM provider credentials (Anthropic, OpenAI) |
+| `tools` | no | Per-tool config (API keys for external services like search) |
+| `agents` | yes | The agents the server hosts |
+
+Validation is strict: missing required fields raise `ConfigError` at startup
+with a specific path (`agents.scribe.model is required`).
+
+## `server`
+
+```json
+"server": {
+  "host": "127.0.0.1",
+  "port": 7777,
+  "auth_secret": "long-random-string"
+}
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `host` | string | `"127.0.0.1"` | Bind address. Use `"0.0.0.0"` inside a container; keep loopback on bare metal and front with TLS. |
+| `port` | int | `7777` | TCP port. |
+| `auth_secret` | string | **required** | Bearer token. Every REST + WS call must send `Authorization: Bearer <auth_secret>` (WS may also pass `?token=...` for browser clients). Use `openssl rand -hex 32`. |
+
+There's no per-user identity in v1 — the auth_secret is the only credential.
+Rotate it by editing the file and restarting; clients pick up the new
+token on their next call.
+
+## `providers`
+
+Each provider entry is a named credential bundle. The key is an arbitrary
+identifier you choose; the body specifies which upstream API to talk to,
+the credential, and any URL override. Agents reference providers by this
+identifier, not by the upstream API name — so you can have multiple
+provider entries pointing at the same upstream with different keys.
+
+```json
+"providers": {
+  "anthropic":    { "provider_type": "anthropic", "api_key": "sk-ant-..." },
+  "claude_work":  { "provider_type": "anthropic", "api_key": "sk-ant-different" },
+  "openai":       { "provider_type": "openai",    "api_key": "sk-..." },
+  "openrouter":   { "provider_type": "openrouter", "api_key": "sk-or-..." }
+}
+```
+
+Per-provider fields:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `provider_type` | string | yes | One of `anthropic`, `openai`, `openrouter`. Determines which SDK and wire format to use. |
+| `api_key` | string | yes | The upstream API key. |
+| `base_url` | string | no | Override the default endpoint. Useful for proxies, Azure / Bedrock front-doors, self-hosted gateways, or pointing `openai` at any OpenAI-compatible service. OpenRouter's default is already set; only override if you need to. |
+
+Supported `provider_type` values:
+
+| `provider_type` | Default endpoint | Model id format |
+|---|---|---|
+| `anthropic` | `https://api.anthropic.com` | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
+| `openai` | `https://api.openai.com/v1` | `gpt-5`, `gpt-5-mini`, etc. |
+| `openrouter` | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4-6`, `openai/gpt-5`, `meta-llama/llama-3.1-70b-instruct`, … |
+
+`openrouter` is wire-compatible with `openai` (it's an OpenAI-compatible
+gateway), so streaming and tool calling behave identically; the difference
+is in model-id format. See https://openrouter.ai/models for the catalog.
+
+A provider only needs to be defined if an agent references it. The provider
+identifier is independent of `provider_type` — naming an entry
+`"anthropic"` is fine but not required.
+
+## `tools`
+
+```json
+"tools": {
+  "brave_search": { "api_key": "BSA..." }
+}
+```
+
+Top-level keys are tool names. The shape under each key is tool-specific —
+the harness reads them as raw dicts so each tool can define its own fields.
+Built-in tools that don't need configuration (`read_file`, `write_file`,
+`list_files`, `run_command`) don't appear here at all.
+
+Built-in tools that *do* care about this section:
+
+| Tool | Fields | Notes |
+|---|---|---|
+| (none yet exposed in v1) | — | The Brave search example above is reserved for the planned `search_web` tool. |
+
+Custom skills can read this section via `current_context().config.tools` to
+pick up their own API keys.
+
+## `agents`
+
+```json
+"agents": {
+  "scribe": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "workspace": "/var/lib/ark/agents/scribe/workspace",
+    "always_loaded_skills": ["notes", "calendar"]
+  }
+}
+```
+
+Each agent is keyed by name. The name is what you use everywhere — CLI
+(`ark chat scribe`), REST paths (`/agents/scribe/sessions`), filesystem
+(`~/.ark/agents/scribe/`).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `provider` | string | yes | Identifier of a `providers` entry. Two agents can share one provider (same key, same upstream), or point at different entries (different keys, different rate-limit pools). |
+| `model` | string | yes | Provider-specific model id. |
+| `workspace` | string | no | Absolute path the agent treats as its working directory. Defaults to `<ARK_HOME>/agents/<name>/workspace`. `~` is expanded. |
+| `always_loaded_skills` | string[] | no | Names of skills whose tool schemas are exposed on every session start. Skills not in this list are still discoverable via `list_skills()` / `load_skill()`. |
+
+Two files live alongside each agent's config — Ark creates them on
+`init` / `serve` if missing, and you edit them as part of agent design:
+
+- `<ARK_HOME>/agents/<name>/session_context.md` — system prompt for every session.
+- `<ARK_HOME>/agents/<name>/heartbeat_prompt.md` — starting message for heartbeat sessions.
+
+These aren't in `config.json`; they're plain markdown the agent reads at
+turn time.
+
+## Full example
+
+Two agents on one server — one Anthropic-backed conversational assistant,
+one OpenAI-backed background worker:
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 7777,
+    "auth_secret": "REPLACE_ME_WITH_OPENSSL_RAND_HEX_32"
+  },
+  "providers": {
+    "anthropic":   { "provider_type": "anthropic",  "api_key": "sk-ant-..." },
+    "claude_work": { "provider_type": "anthropic",  "api_key": "sk-ant-different" },
+    "openai":      { "provider_type": "openai",     "api_key": "sk-..." },
+    "or":          { "provider_type": "openrouter", "api_key": "sk-or-..." }
+  },
+  "agents": {
+    "scribe":   { "provider": "anthropic",   "model": "claude-sonnet-4-6",
+                  "always_loaded_skills": ["notes"] },
+    "clerk":    { "provider": "claude_work", "model": "claude-haiku-4-5-20251001" },
+    "courier":  { "provider": "openai",      "model": "gpt-5-mini",
+                  "always_loaded_skills": ["inbox"] },
+    "tinkerer": { "provider": "or",          "model": "meta-llama/llama-3.1-70b-instruct" }
+  }
+}
+```
+
+`scribe` and `clerk` are both Anthropic but use different keys — useful when
+you want separate rate-limit pools, separate billing, or one key scoped to
+testing.
+
+## What is *not* in config.json
+
+These are deliberate omissions — they live elsewhere because they're either
+runtime state or out of v1 scope:
+
+| Setting | Where | How to change |
+|---|---|---|
+| Heartbeat interval | `agent_state` table | `ark heartbeat <agent> <seconds>` (CLI), `PUT /agents/<name>/heartbeat` (REST), or `set_heartbeat` tool (agent) |
+| Cron entries | `crons` table | `ark cron set/list/remove ...` (CLI), `PUT/GET/DELETE /agents/<name>/crons/...` (REST), or `add_cron`/`remove_cron`/`list_crons` tools (agent) |
+| Skill code | `<ARK_HOME>/skills/*.py` and `<ARK_HOME>/agents/<name>/skills/*.py` | Drop files in directly; restart server to pick up changes |
+| Session context | `<ARK_HOME>/agents/<name>/session_context.md` | Edit the file; new sessions see the new prompt |
+| Heartbeat prompt | `<ARK_HOME>/agents/<name>/heartbeat_prompt.md` | Edit the file; next heartbeat uses the new prompt |
+| Per-call token limits | not configurable in v1 | `max_tokens` is hardcoded to 4096 in `provider.py` |
+| Logging level | not configurable in v1 | Uvicorn defaults; tweak via env vars at process start if needed |
+| TLS | not in Ark | Front with Caddy / nginx — see [deploy.md](deploy.md) |
+
+## File location and permissions
+
+The default location is `~/.ark/config.json`. Override the parent
+directory with the `ARK_HOME` env var. The file holds your bearer token
+and provider API keys — treat it like a secret:
+
+```
+chmod 600 ~/.ark/config.json
+```
+
+In the Docker dev setup, the config sits at `./.ark-home/config.json` on
+the host and is bind-mounted into the container as `/root/.ark/config.json`.
+
+## When to restart
+
+Restart the server after editing:
+
+- Anything in `config.json`
+- `session_context.md` (technically picked up per-session, but be consistent)
+- Skill files (no hot reload in v1)
+
+You **don't** need to restart after:
+
+- Changing heartbeats, crons, or loaded skills via tools/CLI
+- Editing `heartbeat_prompt.md` (read at fire time)
+- Sending new messages or creating new sessions
+
+## Common mistakes
+
+- **`auth_secret` is empty or missing.** Server refuses to start. Set it.
+- **Agent references a provider that isn't in `providers`.** Validation
+  rejects the config; check the error path it cites.
+- **Missing or unknown `provider_type` on a provider entry.** Must be one
+  of `anthropic`, `openai`, `openrouter`. Typos like `"claude"` fail at load.
+- **`host: "0.0.0.0"` on bare metal.** Now reachable from anywhere; combine
+  with TLS + a strong token, or revert to `"127.0.0.1"`.
+- **Editing the file in the running container and expecting it to apply.**
+  Restart with `docker compose restart ark`.
+- **Forgetting to `chmod 600`.** Anyone on the box can read your API keys.
+- **Committing the file.** The repo's `.gitignore` covers `.ark-home/` for
+  the dev workflow; if you put the config elsewhere, add that path too.

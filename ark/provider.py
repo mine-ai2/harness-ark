@@ -1,0 +1,384 @@
+"""LLM provider abstraction + Anthropic adapter.
+
+Providers translate Ark's normalized `Message` / `ToolSchema` types into the
+underlying API's wire format, and the streamed responses back into the
+normalized `ProviderEvent` union.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, AsyncIterator, Iterable, Protocol
+
+import anthropic
+from openai import AsyncOpenAI
+
+from .types import (
+    AssistantText,
+    AssistantTurnEnd,
+    Message,
+    ProviderEvent,
+    TextDelta,
+    ThinkingDelta,
+    ToolCall,
+    ToolCallEvent,
+    ToolResult,
+    ToolSchema,
+    UserText,
+)
+
+
+class Provider(Protocol):
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[ProviderEvent]: ...
+
+
+# ---------------------------------------------------------------------------
+# Anthropic adapter
+# ---------------------------------------------------------------------------
+
+
+class AnthropicProvider:
+    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._client = anthropic.AsyncAnthropic(**kwargs)
+
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[ProviderEvent]:
+        api_messages = to_anthropic_messages(messages)
+        api_tools = [to_anthropic_tool(t) for t in tools]
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "system": system,
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+        }
+        if api_tools:
+            kwargs["tools"] = api_tools
+        state = _State()
+        async with self._client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                for translated in _translate(event, state):
+                    yield translated
+
+
+class _State:
+    __slots__ = ("block_type", "tool_id", "tool_name", "tool_json", "text_buf", "stop_reason")
+
+    def __init__(self) -> None:
+        self.block_type: str | None = None
+        self.tool_id: str | None = None
+        self.tool_name: str | None = None
+        self.tool_json: str = ""
+        self.text_buf: str = ""
+        self.stop_reason: str | None = None
+
+
+def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
+    """Fold our flat message list into Anthropic's nested role/content shape.
+
+    Consecutive `AssistantText` + `ToolCall` entries collapse into a single
+    assistant message with multiple content blocks. Consecutive `ToolResult`
+    entries collapse into a single user message with `tool_result` blocks.
+    """
+
+    out: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        if isinstance(m, UserText):
+            out.append({"role": "user", "content": m.text})
+            i += 1
+        elif isinstance(m, (AssistantText, ToolCall)):
+            blocks: list[dict[str, Any]] = []
+            while i < n and isinstance(messages[i], (AssistantText, ToolCall)):
+                msg = messages[i]
+                if isinstance(msg, AssistantText):
+                    if msg.text:
+                        blocks.append({"type": "text", "text": msg.text})
+                else:
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": msg.id,
+                            "name": msg.name,
+                            "input": msg.input,
+                        }
+                    )
+                i += 1
+            if blocks:
+                out.append({"role": "assistant", "content": blocks})
+        elif isinstance(m, ToolResult):
+            blocks = []
+            while i < n and isinstance(messages[i], ToolResult):
+                tr = messages[i]
+                block: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": tr.call_id,
+                    "content": tr.output,
+                }
+                if tr.is_error:
+                    block["is_error"] = True
+                blocks.append(block)
+                i += 1
+            out.append({"role": "user", "content": blocks})
+        else:  # pragma: no cover
+            raise TypeError(f"unknown message: {type(m).__name__}")
+    return out
+
+
+def to_anthropic_tool(t: ToolSchema) -> dict[str, Any]:
+    return {
+        "name": t.name,
+        "description": t.description,
+        "input_schema": t.input_schema,
+    }
+
+
+def translate_stream(events: Iterable[Any]) -> Iterable[ProviderEvent]:
+    """Convert raw Anthropic stream events into normalized ProviderEvents.
+
+    Pulled out as a sync helper over a regular iterable so it can be unit-tested
+    without the async SDK.
+    """
+
+    state = _State()
+    for event in events:
+        yield from _translate(event, state)
+
+
+def _translate(event: Any, state: _State) -> Iterable[ProviderEvent]:
+    et = getattr(event, "type", None)
+    if et == "content_block_start":
+        cb = getattr(event, "content_block", None)
+        if cb is None:
+            return
+        state.block_type = getattr(cb, "type", None)
+        if state.block_type == "tool_use":
+            state.tool_id = getattr(cb, "id", None)
+            state.tool_name = getattr(cb, "name", None)
+            state.tool_json = ""
+    elif et == "content_block_delta":
+        delta = getattr(event, "delta", None)
+        if delta is None:
+            return
+        dt = getattr(delta, "type", None)
+        if dt == "text_delta":
+            text = getattr(delta, "text", "")
+            state.text_buf += text
+            if text:
+                yield TextDelta(text=text)
+        elif dt == "thinking_delta":
+            text = getattr(delta, "thinking", "")
+            if text:
+                yield ThinkingDelta(text=text)
+        elif dt == "input_json_delta":
+            state.tool_json += getattr(delta, "partial_json", "")
+        # signature_delta and unknowns: ignore
+    elif et == "content_block_stop":
+        if state.block_type == "tool_use" and state.tool_id is not None:
+            parsed: dict[str, Any] = {}
+            if state.tool_json.strip():
+                try:
+                    parsed = json.loads(state.tool_json)
+                except json.JSONDecodeError:
+                    parsed = {}
+            yield ToolCallEvent(
+                id=state.tool_id,
+                name=state.tool_name or "",
+                input=parsed,
+            )
+            state.tool_id = None
+            state.tool_name = None
+            state.tool_json = ""
+        state.block_type = None
+    elif et == "message_delta":
+        delta = getattr(event, "delta", None)
+        if delta is not None:
+            sr = getattr(delta, "stop_reason", None)
+            if sr:
+                state.stop_reason = sr
+    elif et == "message_stop":
+        yield AssistantTurnEnd(text=state.text_buf, stop_reason=state.stop_reason)
+        state.text_buf = ""
+        state.stop_reason = None
+
+
+# ---------------------------------------------------------------------------
+# OpenAI adapter
+# ---------------------------------------------------------------------------
+
+
+class OpenAIProvider:
+    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self._client = AsyncOpenAI(**kwargs)
+
+
+class OpenRouterProvider(OpenAIProvider):
+    """OpenRouter via the OpenAI-compatible chat completions API.
+
+    Model ids are namespaced by source provider — e.g. `anthropic/claude-sonnet-4-6`,
+    `openai/gpt-4o`, `meta-llama/llama-3.1-70b-instruct`. See
+    https://openrouter.ai/models for the full catalog.
+    """
+
+    DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+        super().__init__(api_key=api_key, base_url=base_url or self.DEFAULT_BASE_URL)
+
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[ProviderEvent]:
+        api_messages = to_openai_messages(system, messages)
+        api_tools = [to_openai_tool(t) for t in tools] or None
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if api_tools:
+            kwargs["tools"] = api_tools
+        stream = await self._client.chat.completions.create(**kwargs)
+        async for evt in _translate_openai_stream(stream):
+            yield evt
+
+
+def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
+    """Fold flat messages into OpenAI chat-completions shape."""
+
+    out: list[dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": system})
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        if isinstance(m, UserText):
+            out.append({"role": "user", "content": m.text})
+            i += 1
+        elif isinstance(m, (AssistantText, ToolCall)):
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            while i < n and isinstance(messages[i], (AssistantText, ToolCall)):
+                msg = messages[i]
+                if isinstance(msg, AssistantText):
+                    if msg.text:
+                        text_parts.append(msg.text)
+                else:
+                    tool_calls.append(
+                        {
+                            "id": msg.id,
+                            "type": "function",
+                            "function": {
+                                "name": msg.name,
+                                "arguments": json.dumps(msg.input),
+                            },
+                        }
+                    )
+                i += 1
+            entry: dict[str, Any] = {"role": "assistant"}
+            entry["content"] = "\n".join(text_parts) if text_parts else None
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+        elif isinstance(m, ToolResult):
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": m.call_id,
+                    "content": m.output if not m.is_error else f"ERROR: {m.output}",
+                }
+            )
+            i += 1
+        else:  # pragma: no cover
+            raise TypeError(f"unknown message: {type(m).__name__}")
+    return out
+
+
+def to_openai_tool(t: ToolSchema) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.input_schema,
+        },
+    }
+
+
+async def _translate_openai_stream(stream) -> AsyncIterator[ProviderEvent]:
+    """Convert OpenAI streaming chunks to normalized ProviderEvents.
+
+    OpenAI tool-call deltas come keyed by `index`; we assemble them up before
+    emitting the ToolCallEvent at end-of-stream.
+    """
+
+    text_buf = ""
+    stop_reason: str | None = None
+    # index -> {id, name, args}
+    tool_calls: dict[int, dict[str, Any]] = {}
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if delta.content:
+            text_buf += delta.content
+            yield TextDelta(text=delta.content)
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "args": ""})
+                if tc.id:
+                    slot["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function.arguments:
+                        slot["args"] += tc.function.arguments
+        if choice.finish_reason:
+            stop_reason = choice.finish_reason
+
+    for idx in sorted(tool_calls):
+        slot = tool_calls[idx]
+        parsed: dict[str, Any] = {}
+        if slot["args"].strip():
+            try:
+                parsed = json.loads(slot["args"])
+            except json.JSONDecodeError:
+                parsed = {}
+        yield ToolCallEvent(
+            id=slot["id"] or f"call_{idx}",
+            name=slot["name"] or "",
+            input=parsed,
+        )
+    yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)

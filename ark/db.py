@@ -1,0 +1,83 @@
+"""SQLite connection + schema migrations.
+
+Schema version is tracked via SQLite's `user_version` PRAGMA. Each migration is
+a tuple (target_version, sql). To add a new migration, append a tuple — never
+edit a past one.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from . import paths
+
+MIGRATIONS: list[tuple[int, str]] = [
+    (
+        1,
+        """
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY,
+          agent_name TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          ended_at INTEGER
+        );
+
+        CREATE INDEX idx_sessions_agent ON sessions(agent_name, created_at DESC);
+
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          role TEXT NOT NULL,
+          content_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (session_id, seq)
+        );
+
+        CREATE TABLE agent_state (
+          agent_name TEXT PRIMARY KEY,
+          heartbeat_seconds INTEGER
+        );
+
+        CREATE TABLE crons (
+          agent_name TEXT NOT NULL,
+          id TEXT NOT NULL,
+          expr TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (agent_name, id)
+        );
+        """,
+    ),
+]
+
+
+def connect(path: Path | None = None) -> sqlite3.Connection:
+    path = path or paths.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # check_same_thread=False: FastAPI dispatches sync route handlers to a thread
+    # pool, so a single shared connection is read/written from multiple threads.
+    # SQLite serializes its own writes; WAL mode handles concurrent readers.
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    for target, sql in MIGRATIONS:
+        if target <= current:
+            continue
+        conn.executescript("BEGIN;\n" + sql + f"\nPRAGMA user_version = {target};\nCOMMIT;")
+        current = target
+    return current
+
+
+def init_db(path: Path | None = None) -> sqlite3.Connection:
+    conn = connect(path)
+    migrate(conn)
+    return conn
