@@ -1,7 +1,19 @@
 """OpenRouter provider — thin subclass of OpenAIProvider with a default base URL."""
 
+import inspect
+
 from ark.provider import OpenAIProvider, OpenRouterProvider
 from ark.runtime import make_provider
+
+
+def test_openai_provider_has_stream_turn():
+    """Regression: stream_turn must be defined on the OpenAI class itself,
+    not orphaned in a subclass during edits."""
+    assert inspect.isasyncgenfunction(OpenAIProvider.stream_turn)
+
+
+def test_openrouter_inherits_stream_turn():
+    assert OpenRouterProvider.stream_turn is OpenAIProvider.stream_turn
 
 
 def test_openrouter_defaults_to_openrouter_base_url():

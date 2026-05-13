@@ -139,10 +139,27 @@ def append_message(conn: sqlite3.Connection, session_id: str, msg: Message) -> N
 
 
 def system_prompt(agent: AgentConfig) -> str:
-    path = paths.agent_dir(agent.name) / "session_context.md"
-    if path.exists():
-        return path.read_text()
-    return f"You are {agent.name}, an agent in the Ark harness."
+    """Build the system prompt: the user's session_context.md followed by a
+    runtime-injected Environment stanza so the model has concrete grounding for
+    file/shell tool calls."""
+
+    ctx_path = paths.agent_dir(agent.name) / "session_context.md"
+    body = (
+        ctx_path.read_text()
+        if ctx_path.exists()
+        else f"You are {agent.name}, an agent in the Ark harness."
+    )
+    env = (
+        "\n\n---\n"
+        "Environment (managed by the Ark harness, do not invent paths):\n"
+        f"- Your name: {agent.name}\n"
+        f"- Your workspace directory: {agent.workspace}\n"
+        "- File and shell tools (read_file, write_file, list_files, run_command) "
+        "operate on real paths on this server. The current working directory for "
+        "each tool call is your workspace above. When in doubt about where a file "
+        "lives, call list_files first instead of guessing.\n"
+    )
+    return body + env
 
 
 # ---------------------------------------------------------------------------

@@ -233,6 +233,31 @@ class OpenAIProvider:
             kwargs["base_url"] = base_url
         self._client = AsyncOpenAI(**kwargs)
 
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[ProviderEvent]:
+        api_messages = to_openai_messages(system, messages)
+        api_tools = [to_openai_tool(t) for t in tools] or None
+        # `max_completion_tokens` is the modern field; reasoning models (gpt-5, o1,
+        # o3) reject `max_tokens` outright. Older models accept both.
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": api_messages,
+            "max_completion_tokens": max_tokens,
+            "stream": True,
+        }
+        if api_tools:
+            kwargs["tools"] = api_tools
+        stream = await self._client.chat.completions.create(**kwargs)
+        async for evt in _translate_openai_stream(stream):
+            yield evt
+
 
 class OpenRouterProvider(OpenAIProvider):
     """OpenRouter via the OpenAI-compatible chat completions API.
@@ -246,29 +271,6 @@ class OpenRouterProvider(OpenAIProvider):
 
     def __init__(self, api_key: str, base_url: str | None = None) -> None:
         super().__init__(api_key=api_key, base_url=base_url or self.DEFAULT_BASE_URL)
-
-    async def stream_turn(
-        self,
-        *,
-        model: str,
-        system: str,
-        messages: list[Message],
-        tools: list[ToolSchema],
-        max_tokens: int = 4096,
-    ) -> AsyncIterator[ProviderEvent]:
-        api_messages = to_openai_messages(system, messages)
-        api_tools = [to_openai_tool(t) for t in tools] or None
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": api_messages,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if api_tools:
-            kwargs["tools"] = api_tools
-        stream = await self._client.chat.completions.create(**kwargs)
-        async for evt in _translate_openai_stream(stream):
-            yield evt
 
 
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:

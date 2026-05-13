@@ -12,8 +12,8 @@ from .config import AgentConfig, Config
 
 DEFAULT_SESSION_CONTEXT = """\
 You are {name}, an agent running inside the Ark harness.
-Edit this file (~/.ark/agents/{name}/session_context.md) to set your persona,
-goals, and any persistent context that should accompany every session.
+This file is your persistent session context — edit it to set your persona,
+goals, and anything else that should accompany every session.
 """
 
 DEFAULT_HEARTBEAT_PROMPT = """\
