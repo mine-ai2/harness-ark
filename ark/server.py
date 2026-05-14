@@ -9,10 +9,10 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import broker, db, runtime, skills
+from . import broker, db, runtime, skills, workspace as ws
 from .config import Config
 from .scheduler import Scheduler
 from .types import (
@@ -22,7 +22,10 @@ from .types import (
     ThinkingDelta,
     ToolCallEvent,
     ToolResultEvent,
+    UploadMessage,
 )
+
+UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # 25 MB v1 cap
 
 
 def create_app(config: Config) -> FastAPI:
@@ -174,6 +177,80 @@ def create_app(config: Config) -> FastAPI:
         if not runtime.session_exists(conn, sid, name):
             raise HTTPException(404, "unknown session")
         return [_message_to_json(m) for m in runtime.load_history(conn, sid)]
+
+    # ------------------------------------------------------------------
+    # File transfer: shared uploads bucket + arbitrary workspace downloads
+    # ------------------------------------------------------------------
+
+    @app.post("/agents/{name}/sessions/{sid}/uploads")
+    async def upload_file(name: str, sid: str, file: UploadFile = File(...)):
+        agent = config.agents.get(name)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        if not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+        if not file.filename:
+            raise HTTPException(400, "missing filename")
+
+        try:
+            dest = ws.reserve_upload_filename(agent.workspace, file.filename)
+        except ws.WorkspaceError as e:
+            raise HTTPException(400, str(e))
+
+        # Stream to disk, enforcing the cap.
+        written = 0
+        chunk_size = 64 * 1024
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > UPLOAD_MAX_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(413, f"upload exceeds {UPLOAD_MAX_BYTES} bytes")
+                out.write(chunk)
+
+        rel = ws.relative_to_workspace(agent.workspace, dest)
+        runtime.append_message(
+            conn,
+            sid,
+            UploadMessage(path=rel, original_name=file.filename, size=written),
+        )
+        return {"path": rel, "size": written, "original_name": file.filename}
+
+    @app.get("/agents/{name}/sessions/{sid}/uploads")
+    def list_uploads(name: str, sid: str):
+        agent = config.agents.get(name)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        if not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+        uploads = ws.uploads_dir(agent.workspace)
+        if not uploads.is_dir():
+            return []
+        entries = []
+        for p in sorted(uploads.iterdir(), key=lambda e: e.stat().st_mtime, reverse=True):
+            if p.is_file():
+                stat = p.stat()
+                entries.append(
+                    {"path": f"{ws.UPLOADS_DIRNAME}/{p.name}", "size": stat.st_size, "mtime": int(stat.st_mtime)}
+                )
+        return entries
+
+    @app.get("/agents/{name}/files/{path:path}")
+    def download_file(name: str, path: str):
+        agent = config.agents.get(name)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        try:
+            full = ws.resolve(agent.workspace, path)
+        except ws.WorkspaceError as e:
+            raise HTTPException(400, str(e))
+        if not full.is_file():
+            raise HTTPException(404, "not found")
+        return FileResponse(full, filename=full.name)
 
     @app.websocket("/agents/{name}/sessions/{sid}")
     async def ws_session(ws: WebSocket, name: str, sid: str):

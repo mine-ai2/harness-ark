@@ -18,14 +18,28 @@ from .types import (
     AssistantTurnEnd,
     Message,
     ProviderEvent,
+    SharedFile,
     TextDelta,
     ThinkingDelta,
     ToolCall,
     ToolCallEvent,
     ToolResult,
     ToolSchema,
+    UploadMessage,
     UserText,
 )
+
+
+def _upload_marker(msg: UploadMessage) -> str:
+    return (
+        f"[user attached a file: original name '{msg.original_name}', "
+        f"workspace path '{msg.path}', {msg.size} bytes]"
+    )
+
+
+def _shared_marker(msg: SharedFile) -> str:
+    desc = f' — "{msg.description}"' if msg.description else ""
+    return f"[shared with user: '{msg.path}' ({msg.size} bytes){desc}]"
 
 
 class Provider(Protocol):
@@ -106,13 +120,18 @@ def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
         if isinstance(m, UserText):
             out.append({"role": "user", "content": m.text})
             i += 1
-        elif isinstance(m, (AssistantText, ToolCall)):
+        elif isinstance(m, UploadMessage):
+            out.append({"role": "user", "content": _upload_marker(m)})
+            i += 1
+        elif isinstance(m, (AssistantText, ToolCall, SharedFile)):
             blocks: list[dict[str, Any]] = []
-            while i < n and isinstance(messages[i], (AssistantText, ToolCall)):
+            while i < n and isinstance(messages[i], (AssistantText, ToolCall, SharedFile)):
                 msg = messages[i]
                 if isinstance(msg, AssistantText):
                     if msg.text:
                         blocks.append({"type": "text", "text": msg.text})
+                elif isinstance(msg, SharedFile):
+                    blocks.append({"type": "text", "text": _shared_marker(msg)})
                 else:
                     blocks.append(
                         {
@@ -286,14 +305,19 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, A
         if isinstance(m, UserText):
             out.append({"role": "user", "content": m.text})
             i += 1
-        elif isinstance(m, (AssistantText, ToolCall)):
+        elif isinstance(m, UploadMessage):
+            out.append({"role": "user", "content": _upload_marker(m)})
+            i += 1
+        elif isinstance(m, (AssistantText, ToolCall, SharedFile)):
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
-            while i < n and isinstance(messages[i], (AssistantText, ToolCall)):
+            while i < n and isinstance(messages[i], (AssistantText, ToolCall, SharedFile)):
                 msg = messages[i]
                 if isinstance(msg, AssistantText):
                     if msg.text:
                         text_parts.append(msg.text)
+                elif isinstance(msg, SharedFile):
+                    text_parts.append(_shared_marker(msg))
                 else:
                     tool_calls.append(
                         {

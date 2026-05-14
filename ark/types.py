@@ -39,7 +39,31 @@ class ToolResult:
     is_error: bool = False
 
 
-Message = Union[UserText, AssistantText, ToolCall, ToolResult]
+@dataclass
+class UploadMessage:
+    """A file the client uploaded into the agent's workspace.
+
+    Stored as user-side context in conversation history. The actual bytes
+    live on disk at <workspace>/<path>; this message is just the record."""
+
+    path: str  # workspace-relative
+    original_name: str  # filename before any auto-suffix
+    size: int
+
+
+@dataclass
+class SharedFile:
+    """A file the agent has shared with the client via `share_with_client`.
+
+    Stored as assistant-side context in conversation history. The bytes live
+    on disk at <workspace>/<path>; clients fetch via the download endpoint."""
+
+    path: str  # workspace-relative
+    description: str = ""
+    size: int = 0
+
+
+Message = Union[UserText, AssistantText, ToolCall, ToolResult, UploadMessage, SharedFile]
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +150,18 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             "output": msg.output,
             "is_error": msg.is_error,
         }
+    if isinstance(msg, UploadMessage):
+        return "upload", {
+            "path": msg.path,
+            "original_name": msg.original_name,
+            "size": msg.size,
+        }
+    if isinstance(msg, SharedFile):
+        return "shared_file", {
+            "path": msg.path,
+            "description": msg.description,
+            "size": msg.size,
+        }
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -141,5 +177,17 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             call_id=content["call_id"],
             output=content["output"],
             is_error=content.get("is_error", False),
+        )
+    if role == "upload":
+        return UploadMessage(
+            path=content["path"],
+            original_name=content["original_name"],
+            size=content["size"],
+        )
+    if role == "shared_file":
+        return SharedFile(
+            path=content["path"],
+            description=content.get("description", ""),
+            size=content.get("size", 0),
         )
     raise ValueError(f"unknown role: {role}")

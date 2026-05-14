@@ -158,6 +158,12 @@ def system_prompt(agent: AgentConfig) -> str:
         "operate on real paths on this server. The current working directory for "
         "each tool call is your workspace above. When in doubt about where a file "
         "lives, call list_files first instead of guessing.\n"
+        "- Files the user attaches arrive in `uploads/` (relative to your workspace). "
+        "Newer uploads of the same name are auto-suffixed (e.g. `report-2.pdf`). "
+        "Use `list_uploads` to see what's available, newest first.\n"
+        "- To hand a file back to the user, write it anywhere in your workspace "
+        "and then call `share_with_client(path)`. The user's client will be "
+        "notified and given a download link.\n"
     )
     return body + env
 

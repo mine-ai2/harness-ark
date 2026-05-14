@@ -363,6 +363,87 @@ _register(
 
 
 # ---------------------------------------------------------------------------
+# File transfer to/from the client
+# ---------------------------------------------------------------------------
+
+
+def _list_uploads() -> str:
+    from . import workspace as ws
+
+    ctx = current_context()
+    uploads = ws.uploads_dir(ctx.agent.workspace)
+    if not uploads.is_dir():
+        return "(no uploads)"
+    entries = sorted(
+        (p for p in uploads.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not entries:
+        return "(no uploads)"
+    lines = []
+    for p in entries:
+        stat = p.stat()
+        lines.append(f"uploads/{p.name}  ({stat.st_size} bytes)")
+    return "\n".join(lines)
+
+
+def _share_with_client(*, path: str, description: str = "") -> str:
+    from . import broker, runtime, workspace as ws
+    from .types import SharedFile
+
+    ctx = current_context()
+    try:
+        full = ws.resolve(ctx.agent.workspace, path)
+    except ws.WorkspaceError as e:
+        raise ToolError(str(e))
+    if not full.is_file():
+        raise ToolError(f"not a file: {path}")
+
+    rel = ws.relative_to_workspace(ctx.agent.workspace, full)
+    size = full.stat().st_size
+    runtime.append_message(
+        ctx.conn, ctx.session_id, SharedFile(path=rel, description=description, size=size)
+    )
+    broker.publish(
+        ctx.session_id,
+        {
+            "type": "file_available",
+            "path": rel,
+            "description": description,
+            "size": size,
+        },
+    )
+    return f"shared {rel} with the client ({size} bytes)"
+
+
+_register(
+    ToolSchema(
+        name="list_uploads",
+        description="List files the user has uploaded into this agent's workspace, newest first. Uploads land in `uploads/<filename>`. If two files were uploaded with the same name, the newer one is suffixed (e.g. `report-2.pdf`).",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    _list_uploads,
+)
+
+_register(
+    ToolSchema(
+        name="share_with_client",
+        description="Make a file in this agent's workspace available to the user. The file appears in their UI as a downloadable artifact. `path` is workspace-relative; `description` is an optional short note shown alongside.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["path"],
+        },
+    ),
+    _share_with_client,
+)
+
+
+# ---------------------------------------------------------------------------
 # Skill meta-tools
 # ---------------------------------------------------------------------------
 

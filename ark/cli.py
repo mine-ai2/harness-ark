@@ -9,12 +9,16 @@ import asyncio
 import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
 import websockets
 
 from . import config, paths
+
+
+DEFAULT_DOWNLOAD_DIR = Path("ark-downloads")
 
 
 def _client_settings() -> tuple[str, str]:
@@ -189,11 +193,49 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
         ui.done()
 
 
-async def _chat(agent: str, session_id: str | None, history_only: bool = False) -> int:
+async def _upload_one(
+    http: httpx.AsyncClient, agent: str, session_id: str, file_path: Path
+) -> dict:
+    if not file_path.is_file():
+        raise FileNotFoundError(f"no such file: {file_path}")
+    with file_path.open("rb") as f:
+        files = {"file": (file_path.name, f, "application/octet-stream")}
+        r = await http.post(f"/agents/{agent}/sessions/{session_id}/uploads", files=files)
+    r.raise_for_status()
+    return r.json()
+
+
+async def _download_shared(
+    http: httpx.AsyncClient, agent: str, path: str, dest_dir: Path
+) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = Path(path).name
+    target = dest_dir / name
+    # auto-suffix to avoid overwriting prior downloads
+    i = 2
+    while target.exists():
+        target = dest_dir / f"{Path(name).stem}-{i}{Path(name).suffix}"
+        i += 1
+    async with http.stream("GET", f"/agents/{agent}/files/{path}") as r:
+        r.raise_for_status()
+        with target.open("wb") as out:
+            async for chunk in r.aiter_bytes(64 * 1024):
+                out.write(chunk)
+    return target
+
+
+async def _chat(
+    agent: str,
+    session_id: str | None,
+    history_only: bool = False,
+    attachments: list[Path] | None = None,
+    download_dir: Path | None = None,
+) -> int:
     base_url, secret = _client_settings()
     headers = _headers(secret)
+    dl_dir = download_dir or DEFAULT_DOWNLOAD_DIR
 
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=30) as http:
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=120) as http:
         if session_id is None:
             r = await http.post(f"/agents/{agent}/sessions")
             r.raise_for_status()
@@ -206,6 +248,19 @@ async def _chat(agent: str, session_id: str | None, history_only: bool = False) 
                 _print_history_entry(m)
             if history_only:
                 return 0
+
+        # Pre-upload any --attach files before opening the WS so the agent
+        # already sees them via list_uploads().
+        for path in attachments or []:
+            try:
+                info = await _upload_one(http, agent, session_id, path)
+                print(
+                    f"[uploaded {path.name} → {info['path']} ({info['size']} bytes)]",
+                    file=sys.stderr,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[upload failed for {path}: {e}]", file=sys.stderr)
+                return 1
 
         ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
         url = f"{ws_url}/agents/{agent}/sessions/{session_id}?token={secret}"
@@ -220,6 +275,9 @@ async def _chat(agent: str, session_id: str | None, history_only: bool = False) 
                 try:
                     async for raw in ws:
                         evt = json.loads(raw)
+                        if evt.get("type") == "file_available":
+                            await _on_file_available(http, agent, evt, dl_dir, ui)
+                            continue
                         _handle_event(ui, evt)
                         if evt.get("type") == "done":
                             turn_done.set()
@@ -243,12 +301,41 @@ async def _chat(agent: str, session_id: str | None, history_only: bool = False) 
                     text = line.strip()
                     if not text:
                         continue
+                    if text.startswith("/attach "):
+                        path = Path(text[len("/attach "):].strip()).expanduser()
+                        try:
+                            info = await _upload_one(http, agent, session_id, path)
+                            print(
+                                f"[uploaded {path.name} → {info['path']} ({info['size']} bytes)]",
+                                file=sys.stderr,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[upload failed: {e}]", file=sys.stderr)
+                        continue
                     turn_done.clear()
                     ui.status("thinking")
                     await ws.send(json.dumps({"type": "user_message", "text": text}))
 
             await asyncio.gather(reader(), writer())
     return 0
+
+
+async def _on_file_available(
+    http: httpx.AsyncClient,
+    agent: str,
+    evt: dict,
+    dl_dir: Path,
+    ui: "_Ui",
+) -> None:
+    path = evt.get("path", "")
+    size = evt.get("size", 0)
+    desc = evt.get("description", "")
+    try:
+        local = await _download_shared(http, agent, path, dl_dir)
+        suffix = f" — {desc}" if desc else ""
+        ui.error_line(f"[agent shared {path} ({size} bytes) → {local}{suffix}]")
+    except Exception as e:  # noqa: BLE001
+        ui.error_line(f"[file_available download failed for {path}: {e}]")
 
 
 def _print_history_entry(m: dict) -> None:
@@ -270,7 +357,11 @@ def _print_history_entry(m: dict) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    return asyncio.run(_chat(args.agent, args.session))
+    attachments = [Path(p).expanduser() for p in (args.attach or [])]
+    dl_dir = Path(args.download_dir).expanduser() if args.download_dir else None
+    return asyncio.run(
+        _chat(args.agent, args.session, attachments=attachments, download_dir=dl_dir)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +492,17 @@ def build_parser() -> argparse.ArgumentParser:
     chat = sub.add_parser("chat", help="open an interactive session")
     chat.add_argument("agent")
     chat.add_argument("--session", help="resume an existing session id")
+    chat.add_argument(
+        "--attach",
+        action="append",
+        metavar="PATH",
+        help="upload a file before chatting (repeatable). The agent sees uploads in its uploads/ dir.",
+    )
+    chat.add_argument(
+        "--download-dir",
+        metavar="DIR",
+        help=f"where to save files the agent shares (default: ./{DEFAULT_DOWNLOAD_DIR})",
+    )
     chat.set_defaults(func=cmd_chat)
 
     serve = sub.add_parser("serve", help="run the Ark server")
