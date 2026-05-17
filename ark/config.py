@@ -14,7 +14,7 @@ class ConfigError(Exception):
     pass
 
 
-KNOWN_PROVIDER_TYPES = frozenset({"anthropic", "openai", "openrouter"})
+KNOWN_PROVIDER_TYPES = frozenset({"anthropic", "google", "openai", "openrouter"})
 
 
 @dataclass

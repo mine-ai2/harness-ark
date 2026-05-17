@@ -177,6 +177,111 @@ _register(
 
 
 # ---------------------------------------------------------------------------
+# Internet: search + URL fetch
+# ---------------------------------------------------------------------------
+
+
+async def _search_web(*, query: str, count: int = 10) -> str:
+    import re as _re
+
+    import httpx as _httpx
+
+    ctx = current_context()
+    cfg = (ctx.config.tools or {}).get("brave_search") or {}
+    api_key = cfg.get("api_key")
+    if not api_key:
+        raise ToolError(
+            "search_web requires `tools.brave_search.api_key` to be set in config.json"
+        )
+    count = max(1, min(int(count), 20))
+    try:
+        async with _httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers={
+                    "X-Subscription-Token": api_key,
+                    "Accept": "application/json",
+                },
+                params={"q": query, "count": count},
+            )
+    except (_httpx.NetworkError, _httpx.TimeoutException, _httpx.HTTPError) as e:
+        raise ToolError(f"brave_search request failed: {type(e).__name__}: {e}")
+    if r.status_code >= 400:
+        raise ToolError(f"brave_search HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    results = ((data.get("web") or {}).get("results") or [])[:count]
+    if not results:
+        return "(no results)"
+    lines = []
+    for item in results:
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        desc = _re.sub(r"<[^>]+>", "", item.get("description") or "").strip()
+        lines.append(f"- {title}\n  {url}\n  {desc}")
+    return "\n".join(lines)
+
+
+async def _fetch_url(*, url: str, timeout_seconds: float = 15) -> str:
+    from . import resolvers
+
+    ctx = current_context()
+    cfg = (ctx.config.tools or {}).get("fetch_url") or {}
+    spec = cfg.get("resolver_sequence")
+    try:
+        chain = resolvers.build_chain(spec)
+    except resolvers.ResolverConfigError as e:
+        raise ToolError(f"fetch_url misconfigured: {e}")
+    # Per-resolver timeout; whole-chain budget is bounded since each resolver
+    # uses its own AsyncClient timeout, so the worst-case wall clock is
+    # roughly len(chain) * timeout.
+    result = await resolvers.fetch_with_chain(
+        url, chain, timeout=float(timeout_seconds)
+    )
+    if not result.ok:
+        raise ToolError(result.content)
+    return result.content
+
+
+_register(
+    ToolSchema(
+        name="search_web",
+        description="Run an internet search via the Brave Search API. Returns the top results as title/URL/snippet triples — follow up on anything that looks relevant with `fetch_url`.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "count": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Number of results to return (1–20).",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    _search_web,
+    is_async=True,
+)
+
+_register(
+    ToolSchema(
+        name="fetch_url",
+        description="Fetch a URL and return its readable content. Tries a configured chain of resolvers (e.g. plain httpx first, then Jina Reader for JS-heavy pages). Returns markdown or extracted text; truncates at 1 MB.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "timeout_seconds": {"type": "number", "default": 15},
+            },
+            "required": ["url"],
+        },
+    ),
+    _fetch_url,
+    is_async=True,
+)
+
+
+# ---------------------------------------------------------------------------
 # Schedule meta-tools — manage the current agent's heartbeat and crons
 # ---------------------------------------------------------------------------
 

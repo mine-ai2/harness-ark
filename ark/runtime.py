@@ -45,6 +45,10 @@ def make_provider(provider_type: str, *, api_key: str, base_url: str | None = No
         from .provider import OpenRouterProvider
 
         return OpenRouterProvider(api_key=api_key, base_url=base_url)
+    if provider_type == "google":
+        from .provider import GoogleProvider
+
+        return GoogleProvider(api_key=api_key, base_url=base_url)
     raise ValueError(f"unsupported provider_type: {provider_type}")
 
 

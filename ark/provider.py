@@ -11,6 +11,8 @@ import json
 from typing import Any, AsyncIterator, Iterable, Protocol
 
 import anthropic
+from google import genai
+from google.genai import types as gtypes
 from openai import AsyncOpenAI
 
 from .types import (
@@ -408,3 +410,186 @@ async def _translate_openai_stream(stream) -> AsyncIterator[ProviderEvent]:
             input=parsed,
         )
     yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
+
+
+# ---------------------------------------------------------------------------
+# Google (Gemini) adapter
+# ---------------------------------------------------------------------------
+
+
+class GoogleProvider:
+    """Native Google Gemini adapter using the `google-genai` SDK.
+
+    Differences worth knowing vs the other adapters:
+    - Roles are `user` and `model` (not `assistant`).
+    - The system prompt is a separate config field, not a message.
+    - Tool calls come back as `function_call` parts inside a single Content;
+      they aren't split across chunks the way OpenAI's tool-call arguments are.
+    - We disable `automatic_function_calling` so the SDK yields the tool
+      calls back to us instead of trying to dispatch them itself.
+    """
+
+    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["http_options"] = gtypes.HttpOptions(base_url=base_url)
+        self._client = genai.Client(**client_kwargs)
+
+    async def stream_turn(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSchema],
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[ProviderEvent]:
+        contents = to_google_contents(messages)
+        config_kwargs: dict[str, Any] = {
+            "max_output_tokens": max_tokens,
+            "automatic_function_calling": gtypes.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        }
+        if system:
+            config_kwargs["system_instruction"] = system
+        if tools:
+            config_kwargs["tools"] = [
+                gtypes.Tool(
+                    function_declarations=[to_google_function_declaration(t) for t in tools]
+                )
+            ]
+        config = gtypes.GenerateContentConfig(**config_kwargs)
+        stream = await self._client.aio.models.generate_content_stream(
+            model=model, contents=contents, config=config
+        )
+        async for evt in _translate_google_stream(stream):
+            yield evt
+
+
+def to_google_contents(messages: list[Message]) -> list[Any]:
+    """Fold our flat message list into Google's `Content` shape.
+
+    user-side cluster (UserText, UploadMessage) → role="user", text parts.
+    assistant-side cluster (AssistantText, ToolCall, SharedFile) → role="model".
+    ToolResult cluster → role="user", function_response parts.
+    """
+
+    out: list[Any] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        if isinstance(m, (UserText, UploadMessage)):
+            parts: list[Any] = []
+            while i < n and isinstance(messages[i], (UserText, UploadMessage)):
+                msg = messages[i]
+                text = msg.text if isinstance(msg, UserText) else _upload_marker(msg)
+                if text:
+                    parts.append(gtypes.Part(text=text))
+                i += 1
+            if parts:
+                out.append(gtypes.Content(role="user", parts=parts))
+        elif isinstance(m, (AssistantText, ToolCall, SharedFile)):
+            parts = []
+            while i < n and isinstance(messages[i], (AssistantText, ToolCall, SharedFile)):
+                msg = messages[i]
+                if isinstance(msg, AssistantText):
+                    if msg.text:
+                        parts.append(gtypes.Part(text=msg.text))
+                elif isinstance(msg, SharedFile):
+                    parts.append(gtypes.Part(text=_shared_marker(msg)))
+                else:
+                    parts.append(
+                        gtypes.Part(
+                            function_call=gtypes.FunctionCall(
+                                id=msg.id, name=msg.name, args=msg.input or {}
+                            )
+                        )
+                    )
+                i += 1
+            if parts:
+                out.append(gtypes.Content(role="model", parts=parts))
+        elif isinstance(m, ToolResult):
+            parts = []
+            while i < n and isinstance(messages[i], ToolResult):
+                tr = messages[i]
+                response: dict[str, Any] = (
+                    {"error": tr.output} if tr.is_error else {"output": tr.output}
+                )
+                parts.append(
+                    gtypes.Part(
+                        function_response=gtypes.FunctionResponse(
+                            id=tr.call_id,
+                            # name is required by the API but we only stored the call_id;
+                            # the model uses id for matching so name="" is acceptable.
+                            name="",
+                            response=response,
+                        )
+                    )
+                )
+                i += 1
+            out.append(gtypes.Content(role="user", parts=parts))
+        else:  # pragma: no cover
+            raise TypeError(f"unknown message: {type(m).__name__}")
+    return out
+
+
+def to_google_function_declaration(t: ToolSchema) -> Any:
+    """Convert our ToolSchema to a Google FunctionDeclaration."""
+
+    return gtypes.FunctionDeclaration(
+        name=t.name,
+        description=t.description,
+        parameters_json_schema=t.input_schema,
+    )
+
+
+async def _translate_google_stream(stream) -> AsyncIterator[ProviderEvent]:
+    """Convert Google's GenerateContentResponse chunks to normalized events.
+
+    Google yields one chunk per content delta. Each chunk's
+    `candidates[0].content.parts` may contain `text` and/or `function_call`
+    parts; we emit a TextDelta for each text part and a ToolCallEvent for
+    each fully-formed function_call. `finish_reason` lands on the last chunk.
+    """
+
+    text_buf = ""
+    stop_reason: str | None = None
+    call_counter = 0
+    async for chunk in stream:
+        candidates = getattr(chunk, "candidates", None) or []
+        if not candidates:
+            continue
+        cand = candidates[0]
+        content = getattr(cand, "content", None)
+        parts = getattr(content, "parts", None) if content else None
+        for part in parts or []:
+            text = getattr(part, "text", None)
+            if text:
+                text_buf += text
+                yield TextDelta(text=text)
+            fc = getattr(part, "function_call", None)
+            if fc is not None:
+                call_counter += 1
+                fc_name = getattr(fc, "name", "") or ""
+                fc_args = getattr(fc, "args", None) or {}
+                fc_id = getattr(fc, "id", None) or f"gemini_{call_counter}"
+                yield ToolCallEvent(id=fc_id, name=fc_name, input=dict(fc_args))
+        fr = getattr(cand, "finish_reason", None)
+        if fr is not None:
+            stop_reason = _finish_reason_to_str(fr)
+    yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
+
+
+def _finish_reason_to_str(fr: Any) -> str | None:
+    if fr is None:
+        return None
+    # Google's FinishReason is an enum; .value gives the string.
+    val = getattr(fr, "value", None)
+    if val is None:
+        val = str(fr)
+    val = str(val).lower()
+    if val in ("finish_reason_unspecified", "unspecified", "none"):
+        return None
+    return val

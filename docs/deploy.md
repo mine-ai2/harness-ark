@@ -168,7 +168,7 @@ What's inside:
 - `config.json` — the server config (sensitive)
 - `ark.db` (+ `-wal`, `-shm`) — sessions, messages, heartbeats, crons
 - `agents/<name>/session_context.md`, `heartbeat_prompt.md`
-- `agents/<name>/workspace/` — whatever the agents have produced
+- `agents/<name>/workspace/` — agent scratch space, plus `workspace/uploads/` which holds every file users have attached via the upload endpoint (see [files.md](files.md))
 - `agents/<name>/skills/` + top-level `skills/` — installed skills
 
 SQLite is hot-backup-safe via WAL mode, but for a clean snapshot run `sqlite3
