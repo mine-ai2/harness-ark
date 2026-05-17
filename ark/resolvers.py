@@ -173,6 +173,70 @@ class JinaResolver:
 
 
 # ---------------------------------------------------------------------------
+# Tavily Extract resolver — POST to `https://api.tavily.com/extract`
+# ---------------------------------------------------------------------------
+
+
+class TavilyResolver:
+    name = "tavily"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        extract_depth: str = "advanced",
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
+        self.api_key = api_key
+        self.extract_depth = extract_depth
+        self.max_bytes = max_bytes
+
+    async def fetch(self, url: str, *, timeout: float) -> FetchResult:
+        if not self.api_key:
+            return FetchResult(
+                ok=False,
+                reason="tavily: missing api_key (set tools.tavily.api_key or pass api_key on the resolver entry)",
+            )
+        body = {
+            "api_key": self.api_key,
+            "urls": [url],
+            "extract_depth": self.extract_depth,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post("https://api.tavily.com/extract", json=body)
+        except (httpx.NetworkError, httpx.TimeoutException, httpx.HTTPError) as e:
+            return FetchResult(ok=False, reason=f"tavily {type(e).__name__}: {e}")
+        if r.status_code >= 400:
+            return FetchResult(
+                ok=False,
+                status=r.status_code,
+                content=r.text[:1000],
+                reason=f"tavily {r.status_code}",
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            return FetchResult(ok=False, reason=f"tavily: invalid JSON: {e}")
+        results = data.get("results") or []
+        if not results:
+            failed = data.get("failed_results") or []
+            reason = (
+                failed[0].get("error", "no content") if failed else "no results returned"
+            )
+            return FetchResult(ok=False, reason=f"tavily: {reason}")
+        content = (results[0].get("raw_content") or "").strip()
+        if not content:
+            return FetchResult(ok=False, reason="tavily: empty raw_content")
+        truncated = False
+        if len(content) > self.max_bytes:
+            content = content[: self.max_bytes]
+            truncated = True
+        if truncated:
+            content += "\n\n[truncated]"
+        return FetchResult(ok=True, status=r.status_code, content=content)
+
+
+# ---------------------------------------------------------------------------
 # Registry + chain driver
 # ---------------------------------------------------------------------------
 
@@ -190,6 +254,11 @@ RESOLVERS: dict[str, ResolverFactory] = {
         api_token=cfg.get("api_token"),
         max_bytes=int(cfg.get("max_bytes", DEFAULT_MAX_BYTES)),
     ),
+    "tavily": lambda cfg: TavilyResolver(
+        api_key=cfg.get("api_key"),
+        extract_depth=cfg.get("extract_depth", "advanced"),
+        max_bytes=int(cfg.get("max_bytes", DEFAULT_MAX_BYTES)),
+    ),
 }
 
 
@@ -197,17 +266,27 @@ def register_resolver(name: str, factory: ResolverFactory) -> None:
     RESOLVERS[name] = factory
 
 
-def build_chain(spec: list | None) -> list[Resolver]:
+def build_chain(
+    spec: list | None, *, vendor_blocks: dict[str, dict[str, Any]] | None = None
+) -> list[Resolver]:
     """Parse a resolver_sequence config list into a list of Resolver instances.
 
     Each entry may be a bare provider name (string) or an object with
-    `{provider: <name>, ...provider-specific config...}`. Unknown providers
-    raise `ResolverConfigError`. An empty/missing spec defaults to a single
-    httpx resolver, matching v1's no-config behavior.
+    `{provider: <name>, ...provider-specific config...}`.
+
+    `vendor_blocks` is the full `tools` config dict — when an entry's provider
+    name matches a top-level vendor block (e.g. `tools.tavily`), fields from
+    that block are used as a fallback for any keys not present in the entry.
+    This lets you type `"tools.tavily.api_key"` once and have both `search_web`
+    (the search tool) and the `tavily` resolver pick it up.
+
+    Unknown providers raise `ResolverConfigError`. An empty/missing spec
+    defaults to a single httpx resolver, matching v1's no-config behavior.
     """
 
     if not spec:
         return [HttpxResolver()]
+    vendor_blocks = vendor_blocks or {}
     chain: list[Resolver] = []
     for entry in spec:
         if isinstance(entry, str):
@@ -228,7 +307,10 @@ def build_chain(spec: list | None) -> list[Resolver]:
             raise ResolverConfigError(
                 f"unknown resolver {name!r}. Known: {sorted(RESOLVERS)}"
             )
-        chain.append(factory(cfg))
+        # Merge vendor block as fallback (entry config wins on conflict).
+        vendor = vendor_blocks.get(name) or {}
+        merged_cfg = {**vendor, **cfg}
+        chain.append(factory(merged_cfg))
     return chain
 
 

@@ -12,6 +12,7 @@ from ark.resolvers import (
     JinaResolver,
     Resolver,
     ResolverConfigError,
+    TavilyResolver,
     build_chain,
     fetch_with_chain,
 )
@@ -261,3 +262,135 @@ async def test_chain_all_fail_summarizes():
     assert "b: rate-limit" in result.reason
     assert "all resolvers failed" in result.content
     assert "last body" in result.content
+
+
+# ---------------------------------------------------------------------------
+# Vendor-block fallback in build_chain
+# ---------------------------------------------------------------------------
+
+
+def test_vendor_block_fills_missing_api_key():
+    """A bare `{provider: tavily}` entry picks up the key from tools.tavily."""
+    chain = build_chain(
+        [{"provider": "tavily"}],
+        vendor_blocks={"tavily": {"api_key": "tvly-from-vendor"}},
+    )
+    assert isinstance(chain[0], TavilyResolver)
+    assert chain[0].api_key == "tvly-from-vendor"
+
+
+def test_entry_config_overrides_vendor_block():
+    chain = build_chain(
+        [{"provider": "tavily", "api_key": "tvly-override"}],
+        vendor_blocks={"tavily": {"api_key": "tvly-fallback"}},
+    )
+    assert chain[0].api_key == "tvly-override"
+
+
+def test_vendor_block_passes_extract_depth():
+    chain = build_chain(
+        [{"provider": "tavily"}],
+        vendor_blocks={
+            "tavily": {"api_key": "tvly", "extract_depth": "basic"}
+        },
+    )
+    assert chain[0].extract_depth == "basic"
+
+
+def test_no_vendor_block_means_no_fallback():
+    chain = build_chain([{"provider": "tavily"}])  # no vendor_blocks at all
+    assert chain[0].api_key is None
+
+
+# ---------------------------------------------------------------------------
+# TavilyResolver
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tavily_no_api_key_returns_fail():
+    r = await TavilyResolver().fetch("https://example.com", timeout=5)
+    assert r.ok is False
+    assert "api_key" in r.reason
+
+
+@pytest.mark.asyncio
+async def test_tavily_extracts_raw_content(mock_http):
+    captured = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["url"] = str(req.url)
+        captured["body"] = req.read().decode()
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "url": "https://example.com/a",
+                        "raw_content": "# Extracted\n\nlong cleaned body here",
+                    }
+                ]
+            },
+        )
+
+    mock_http["handler"] = handler
+    r = await TavilyResolver(api_key="tvly-fake").fetch(
+        "https://example.com/a", timeout=5
+    )
+    assert r.ok is True
+    assert "long cleaned body here" in r.content
+    assert "api.tavily.com/extract" in captured["url"]
+    import json
+
+    body = json.loads(captured["body"])
+    assert body["urls"] == ["https://example.com/a"]
+    assert body["api_key"] == "tvly-fake"
+    assert body["extract_depth"] == "advanced"  # our default
+
+
+@pytest.mark.asyncio
+async def test_tavily_failed_results_propagate(mock_http):
+    mock_http["handler"] = lambda req: httpx.Response(
+        200,
+        json={
+            "results": [],
+            "failed_results": [
+                {"url": "https://example.com/x", "error": "page blocked"}
+            ],
+        },
+    )
+    r = await TavilyResolver(api_key="tvly").fetch("https://example.com/x", timeout=5)
+    assert r.ok is False
+    assert "page blocked" in r.reason
+
+
+@pytest.mark.asyncio
+async def test_tavily_empty_raw_content(mock_http):
+    mock_http["handler"] = lambda req: httpx.Response(
+        200, json={"results": [{"url": "u", "raw_content": "  "}]}
+    )
+    r = await TavilyResolver(api_key="tvly").fetch("https://example.com", timeout=5)
+    assert r.ok is False
+    assert "empty" in r.reason
+
+
+@pytest.mark.asyncio
+async def test_tavily_4xx(mock_http):
+    mock_http["handler"] = lambda req: httpx.Response(401, text="invalid api_key")
+    r = await TavilyResolver(api_key="tvly").fetch("https://example.com", timeout=5)
+    assert r.ok is False
+    assert "401" in r.reason
+
+
+@pytest.mark.asyncio
+async def test_tavily_truncates(mock_http):
+    big = "x" * 50_000
+    mock_http["handler"] = lambda req: httpx.Response(
+        200, json={"results": [{"url": "u", "raw_content": big}]}
+    )
+    r = await TavilyResolver(api_key="tvly", max_bytes=1000).fetch(
+        "https://example.com", timeout=5
+    )
+    assert r.ok is True
+    assert "[truncated]" in r.content
+    assert len(r.content) <= 1100  # bytes + trailing marker

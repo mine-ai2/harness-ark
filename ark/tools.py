@@ -182,16 +182,30 @@ _register(
 
 
 async def _search_web(*, query: str, count: int = 10) -> str:
+    ctx = current_context()
+    tools_cfg = ctx.config.tools or {}
+    search_cfg = tools_cfg.get("search_web") or {}
+    provider = (search_cfg.get("provider") or "brave").lower()
+    if provider == "brave":
+        return await _search_web_brave(tools_cfg, query, count)
+    if provider == "tavily":
+        return await _search_web_tavily(tools_cfg, query, count)
+    raise ToolError(
+        f"unknown search_web provider {provider!r}. Configure tools.search_web.provider "
+        "to one of: 'brave', 'tavily'."
+    )
+
+
+async def _search_web_brave(tools_cfg: dict, query: str, count: int) -> str:
     import re as _re
 
     import httpx as _httpx
 
-    ctx = current_context()
-    cfg = (ctx.config.tools or {}).get("brave_search") or {}
+    cfg = tools_cfg.get("brave_search") or {}
     api_key = cfg.get("api_key")
     if not api_key:
         raise ToolError(
-            "search_web requires `tools.brave_search.api_key` to be set in config.json"
+            "search_web (brave) requires `tools.brave_search.api_key` to be set in config.json"
         )
     count = max(1, min(int(count), 20))
     try:
@@ -221,14 +235,58 @@ async def _search_web(*, query: str, count: int = 10) -> str:
     return "\n".join(lines)
 
 
+async def _search_web_tavily(tools_cfg: dict, query: str, count: int) -> str:
+    import httpx as _httpx
+
+    vendor = tools_cfg.get("tavily") or {}
+    api_key = vendor.get("api_key")
+    if not api_key:
+        raise ToolError(
+            "search_web (tavily) requires `tools.tavily.api_key` to be set in config.json"
+        )
+    search_depth = vendor.get("search_depth", "basic")
+    count = max(1, min(int(count), 20))
+    body = {
+        "api_key": api_key,
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": count,
+    }
+    try:
+        async with _httpx.AsyncClient(timeout=20) as client:
+            r = await client.post("https://api.tavily.com/search", json=body)
+    except (_httpx.NetworkError, _httpx.TimeoutException, _httpx.HTTPError) as e:
+        raise ToolError(f"tavily_search request failed: {type(e).__name__}: {e}")
+    if r.status_code >= 400:
+        raise ToolError(f"tavily_search HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    results = (data.get("results") or [])[:count]
+    if not results:
+        return "(no results)"
+    lines = []
+    for item in results:
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        # Tavily's `content` is already cleaned text; truncate for digestibility.
+        snippet = (item.get("content") or "").strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+        lines.append(f"- {title}\n  {url}\n  {snippet}")
+    return "\n".join(lines)
+
+
 async def _fetch_url(*, url: str, timeout_seconds: float = 15) -> str:
     from . import resolvers
 
     ctx = current_context()
-    cfg = (ctx.config.tools or {}).get("fetch_url") or {}
+    tools_cfg = ctx.config.tools or {}
+    cfg = tools_cfg.get("fetch_url") or {}
     spec = cfg.get("resolver_sequence")
     try:
-        chain = resolvers.build_chain(spec)
+        # `tools_cfg` doubles as vendor blocks: e.g. `tools.tavily.api_key` is
+        # picked up by a `{"provider": "tavily"}` resolver entry that doesn't
+        # specify its own api_key. Per-entry config still wins on conflict.
+        chain = resolvers.build_chain(spec, vendor_blocks=tools_cfg)
     except resolvers.ResolverConfigError as e:
         raise ToolError(f"fetch_url misconfigured: {e}")
     # Per-resolver timeout; whole-chain budget is bounded since each resolver

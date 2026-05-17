@@ -104,28 +104,59 @@ identifier is independent of `provider_type` — naming an entry
 ```json
 "tools": {
   "brave_search": { "api_key": "BSA..." },
+  "tavily":       { "api_key": "tvly-..." },
+  "search_web":   { "provider": "tavily" },
   "fetch_url": {
     "resolver_sequence": [
       "httpx",
+      { "provider": "tavily" },
       { "provider": "jina", "api_token": "jina_..." }
     ]
   }
 }
 ```
 
-Top-level keys are tool names. The shape under each key is tool-specific —
-the harness reads them as raw dicts so each tool can define its own fields.
-Built-in tools that don't need configuration (`read_file`, `write_file`,
-`list_files`, `run_command`, `share_with_client`, `list_uploads`, `list_skills`,
-`load_skill`, the schedule + cross-session meta-tools) don't appear here.
+Top-level keys are tool names *or* vendor blocks. The shape under each key
+is tool-specific — the harness reads them as raw dicts so each tool can
+define its own fields. Built-in tools that don't need configuration
+(`read_file`, `write_file`, `list_files`, `run_command`, `share_with_client`,
+`list_uploads`, `list_skills`, `load_skill`, the schedule + cross-session
+meta-tools) don't appear here.
+
+Vendor blocks (`tools.brave_search`, `tools.tavily`) hold credentials and
+provider-wide options. Tool blocks (`tools.search_web`, `tools.fetch_url`)
+hold per-tool configuration. A single vendor can feed multiple tools — e.g.
+`tools.tavily.api_key` is read by both `search_web` (when using the Tavily
+backend) and the Tavily resolver in the `fetch_url` chain.
 
 ### `tools.brave_search`
+
+Vendor block for Brave Search. Used by `search_web` when its provider is
+`brave` (default).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `api_key` | string | yes (to use Brave) | Brave Search API subscription token. Get one at <https://brave.com/search/api>. |
+
+### `tools.tavily`
+
+Vendor block for Tavily. Used by `search_web` when its provider is `tavily`,
+and by the `tavily` resolver in `fetch_url`. Set the API key once here and
+both consumers pick it up.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `api_key` | string | yes (to use Tavily for either consumer) | Tavily API key. Get one at <https://app.tavily.com/>. |
+| `search_depth` | string | no | Used by `search_web` only. `"basic"` (default, 1 credit) or `"advanced"` (2 credits; returns longer extracted content per result). |
+| `extract_depth` | string | no | Used by the `tavily` fetch resolver. `"basic"` (1 credit) or `"advanced"` (default, 2 credits; uses a headless browser). |
+
+### `tools.search_web`
 
 Powers the built-in `search_web` tool.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `api_key` | string | yes (to use `search_web`) | Brave Search API subscription token. Get one at <https://brave.com/search/api>. `search_web` remains in the tool manifest even without this; calling it without the key returns a configuration error so the agent knows what to ask for. |
+| `provider` | string | no | `"brave"` (default) or `"tavily"`. Determines which backend handles the query. `search_web` remains in the tool manifest regardless; calling it without the corresponding vendor's API key configured returns an error so the agent knows what to ask for. |
 
 ### `tools.fetch_url`
 
@@ -143,6 +174,18 @@ when this section is missing or empty: a single `httpx` resolver.
 |---|---|---|
 | `httpx` | Plain `GET` of the URL, runs the body through HTML → markdown extraction. No external service, no API key. Fails to extract content from JS-heavy SPAs (the chain falls through to the next resolver in that case). | `max_bytes` (optional, default 1 MB cap on returned content) |
 | `jina` | Calls `https://r.jina.ai/<url>`, which renders the page in a headless browser and returns clean markdown. Free without a key, rate-limited by IP; an API key bumps the limits. Adds an external service dependency — requests and responses are visible to Jina. | `api_token` (optional Jina API token), `max_bytes` (optional) |
+| `tavily` | Calls `https://api.tavily.com/extract` with the URL, returning Tavily's cleaned content. Requires an API key from the `tools.tavily` vendor block (or `api_key` set on the resolver entry directly). Same external-service caveat as Jina. | `api_key` (optional override; falls back to `tools.tavily.api_key`), `extract_depth` (`"basic"` or `"advanced"`, default `"advanced"`), `max_bytes` (optional) |
+
+**Vendor-block fallback.** Resolver entries can omit fields that the
+corresponding vendor block provides. So this:
+
+```json
+"tavily": { "api_key": "tvly-..." },
+"fetch_url": { "resolver_sequence": ["httpx", { "provider": "tavily" }] }
+```
+
+… is equivalent to specifying `api_key` directly on the resolver entry. The
+entry config wins if both are set.
 
 **When does a resolver "fall through" to the next one?**
 
@@ -159,16 +202,25 @@ If every resolver fails, the agent gets the last response's body plus a
 one-line summary of why each resolver gave up (e.g. `"httpx: 503; jina:
 429"`), so it can decide what to do.
 
-**Recommended progression**: start with `"resolver_sequence": ["httpx"]`
-(the default, no config needed). If you start hitting JS-heavy pages, add
-Jina as a fallback: `["httpx", {"provider": "jina"}]`. If you hit Jina rate
-limits, add an API token to the Jina entry.
+**Recommended progression**:
 
-**Per-call privacy.** With Jina in the chain, every URL that falls through
-to it is sent to `r.jina.ai`. For sites that bot-block (which trigger
-fall-through), this is usually fine; for sensitive URLs (intranet links,
-signed download URLs) you'd want either to keep Jina out of the chain or
-ask the agent to use `run_command curl` for those one-off cases.
+1. Start with `"resolver_sequence": ["httpx"]` (the default, no config
+   needed). Works for static / SSR pages.
+2. Hitting JS-heavy pages? Add a fallback. Two options for the second tier:
+   - **Tavily** — `["httpx", {"provider": "tavily"}]`. Headless rendering
+     plus cleaning, same vendor as `search_web` if you've already configured
+     it there.
+   - **Jina** — `["httpx", {"provider": "jina"}]`. Headless rendering, free
+     without a key (rate-limited by IP).
+3. Want both for maximum coverage? `["httpx", {"provider": "tavily"}, {"provider": "jina"}]`
+   — httpx for cheap, Tavily for most rendering, Jina as the last-ditch
+   free fallback when Tavily is rate-limited.
+
+**Per-call privacy.** Every URL that falls through to a remote resolver
+(Jina or Tavily) is sent to that service. For sites that bot-block (which
+trigger fall-through), this is usually fine; for sensitive URLs (intranet
+links, signed download URLs) you'd want to keep remote resolvers out of the
+chain or ask the agent to use `run_command curl` for those one-off cases.
 
 ### Skill access to tools config
 

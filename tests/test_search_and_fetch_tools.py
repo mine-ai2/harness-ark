@@ -198,3 +198,150 @@ async def test_fetch_url_all_resolvers_fail(tmp_path, mock_http):
     assert err is True
     assert "all resolvers failed" in out
     assert "httpx" in out and "jina" in out
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_tavily_via_vendor_block(tmp_path, mock_http):
+    """tools.tavily.api_key is picked up by a bare `{provider: tavily}` resolver entry."""
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        calls.append(url)
+        if "api.tavily.com/extract" in url:
+            import json as _json
+
+            body = _json.loads(req.read())
+            assert body["api_key"] == "tvly-from-vendor"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"url": body["urls"][0], "raw_content": "# Tavily got it"}
+                    ]
+                },
+            )
+        # httpx receives an SPA-shell so it falls through
+        body = "<html><body>" + ("<script>x</script>" * 400) + "</body></html>"
+        return httpx.Response(200, text=body)
+
+    mock_http["handler"] = handler
+    ctx = make_ctx(
+        tmp_path,
+        tools_cfg={
+            "tavily": {"api_key": "tvly-from-vendor"},
+            "fetch_url": {"resolver_sequence": ["httpx", {"provider": "tavily"}]},
+        },
+    )
+    out, err = await tools.execute(
+        "fetch_url", {"url": "https://spa.example.com"}, ctx=ctx
+    )
+    assert err is False
+    assert "Tavily got it" in out
+    assert any("api.tavily.com/extract" in u for u in calls)
+
+
+# ---------------------------------------------------------------------------
+# search_web provider dispatch (brave vs tavily)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_web_defaults_to_brave(tmp_path, mock_http):
+    captured = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["url"] = str(req.url)
+        return httpx.Response(
+            200,
+            json={"web": {"results": [{"title": "T", "url": "U", "description": "D"}]}},
+        )
+
+    mock_http["handler"] = handler
+    ctx = make_ctx(tmp_path, tools_cfg={"brave_search": {"api_key": "BSA"}})
+    out, err = await tools.execute("search_web", {"query": "x"}, ctx=ctx)
+    assert err is False
+    assert "api.search.brave.com" in captured["url"]
+
+
+@pytest.mark.asyncio
+async def test_search_web_explicit_tavily(tmp_path, mock_http):
+    captured = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["url"] = str(req.url)
+        captured["body"] = req.read().decode()
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Anthropic",
+                        "url": "https://anthropic.com",
+                        "content": "Build with Claude.",
+                    }
+                ]
+            },
+        )
+
+    mock_http["handler"] = handler
+    ctx = make_ctx(
+        tmp_path,
+        tools_cfg={
+            "tavily": {"api_key": "tvly-fake"},
+            "search_web": {"provider": "tavily"},
+        },
+    )
+    out, err = await tools.execute(
+        "search_web", {"query": "anthropic", "count": 3}, ctx=ctx
+    )
+    assert err is False, out
+    assert "api.tavily.com/search" in captured["url"]
+    import json as _json
+
+    body = _json.loads(captured["body"])
+    assert body["query"] == "anthropic"
+    assert body["max_results"] == 3
+    assert body["api_key"] == "tvly-fake"
+    assert body["search_depth"] == "basic"  # default
+    assert "Anthropic" in out
+    assert "Build with Claude." in out
+
+
+@pytest.mark.asyncio
+async def test_search_web_tavily_advanced_depth_from_vendor(tmp_path, mock_http):
+    captured = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = req.read().decode()
+        return httpx.Response(200, json={"results": []})
+
+    mock_http["handler"] = handler
+    ctx = make_ctx(
+        tmp_path,
+        tools_cfg={
+            "tavily": {"api_key": "tvly", "search_depth": "advanced"},
+            "search_web": {"provider": "tavily"},
+        },
+    )
+    await tools.execute("search_web", {"query": "x"}, ctx=ctx)
+    import json as _json
+
+    body = _json.loads(captured["body"])
+    assert body["search_depth"] == "advanced"
+
+
+@pytest.mark.asyncio
+async def test_search_web_tavily_missing_key(tmp_path):
+    ctx = make_ctx(tmp_path, tools_cfg={"search_web": {"provider": "tavily"}})
+    out, err = await tools.execute("search_web", {"query": "x"}, ctx=ctx)
+    assert err is True
+    assert "tavily.api_key" in out
+
+
+@pytest.mark.asyncio
+async def test_search_web_unknown_provider(tmp_path):
+    ctx = make_ctx(tmp_path, tools_cfg={"search_web": {"provider": "duckduckgo"}})
+    out, err = await tools.execute("search_web", {"query": "x"}, ctx=ctx)
+    assert err is True
+    assert "unknown search_web provider" in out
