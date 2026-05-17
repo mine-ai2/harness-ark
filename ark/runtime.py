@@ -229,7 +229,12 @@ async def run_user_turn(
                     append_message(
                         conn,
                         session_id,
-                        ToolCall(id=tc.id, name=tc.name, input=tc.input),
+                        ToolCall(
+                            id=tc.id,
+                            name=tc.name,
+                            input=tc.input,
+                            thought_signature=tc.thought_signature,
+                        ),
                     )
                 yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
 
@@ -250,7 +255,9 @@ async def run_user_turn(
             append_message(
                 conn,
                 session_id,
-                ToolResult(call_id=tc.id, output=output, is_error=is_error),
+                ToolResult(
+                    call_id=tc.id, output=output, is_error=is_error, name=tc.name
+                ),
             )
             yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)
 

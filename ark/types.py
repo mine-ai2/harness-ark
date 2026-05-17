@@ -6,6 +6,7 @@ provider adapter is responsible for translating to/from its native format.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from typing import Any, Union
 
@@ -30,6 +31,10 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
+    # Provider-specific opaque bytes that must be echoed back when this call
+    # reappears in conversation history. Currently only Gemini 2.5+ thinking
+    # models populate this — other providers leave it None.
+    thought_signature: bytes | None = None
 
 
 @dataclass
@@ -37,6 +42,7 @@ class ToolResult:
     call_id: str
     output: str
     is_error: bool = False
+    name: str = ""  # name of the tool that produced this result (required by Google's API)
 
 
 @dataclass
@@ -98,6 +104,7 @@ class ToolCallEvent:
     id: str
     name: str
     input: dict[str, Any]
+    thought_signature: bytes | None = None  # see ToolCall.thought_signature
 
 
 @dataclass
@@ -143,13 +150,19 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             body["injected_from"] = msg.injected_from
         return "assistant", body
     if isinstance(msg, ToolCall):
-        return "tool_call", {"id": msg.id, "name": msg.name, "input": msg.input}
+        body: dict[str, Any] = {"id": msg.id, "name": msg.name, "input": msg.input}
+        if msg.thought_signature:
+            body["thought_signature_b64"] = base64.b64encode(msg.thought_signature).decode("ascii")
+        return "tool_call", body
     if isinstance(msg, ToolResult):
-        return "tool_result", {
+        body: dict[str, Any] = {
             "call_id": msg.call_id,
             "output": msg.output,
             "is_error": msg.is_error,
         }
+        if msg.name:
+            body["name"] = msg.name
+        return "tool_result", body
     if isinstance(msg, UploadMessage):
         return "upload", {
             "path": msg.path,
@@ -171,12 +184,20 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
     if role == "assistant":
         return AssistantText(text=content["text"], injected_from=content.get("injected_from"))
     if role == "tool_call":
-        return ToolCall(id=content["id"], name=content["name"], input=content["input"])
+        sig_b64 = content.get("thought_signature_b64")
+        sig = base64.b64decode(sig_b64) if sig_b64 else None
+        return ToolCall(
+            id=content["id"],
+            name=content["name"],
+            input=content["input"],
+            thought_signature=sig,
+        )
     if role == "tool_result":
         return ToolResult(
             call_id=content["call_id"],
             output=content["output"],
             is_error=content.get("is_error", False),
+            name=content.get("name", ""),
         )
     if role == "upload":
         return UploadMessage(

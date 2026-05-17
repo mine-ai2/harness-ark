@@ -500,13 +500,14 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
                 elif isinstance(msg, SharedFile):
                     parts.append(gtypes.Part(text=_shared_marker(msg)))
                 else:
-                    parts.append(
-                        gtypes.Part(
-                            function_call=gtypes.FunctionCall(
-                                id=msg.id, name=msg.name, args=msg.input or {}
-                            )
+                    part_kwargs: dict[str, Any] = {
+                        "function_call": gtypes.FunctionCall(
+                            id=msg.id, name=msg.name, args=msg.input or {}
                         )
-                    )
+                    }
+                    if msg.thought_signature:
+                        part_kwargs["thought_signature"] = msg.thought_signature
+                    parts.append(gtypes.Part(**part_kwargs))
                 i += 1
             if parts:
                 out.append(gtypes.Content(role="model", parts=parts))
@@ -514,6 +515,10 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
             parts = []
             while i < n and isinstance(messages[i], ToolResult):
                 tr = messages[i]
+                # Google's API requires a non-empty `name` on every FunctionResponse.
+                # ToolResult carries it directly on new rows; for old rows that
+                # predate that field, look back for the matching ToolCall by id.
+                name = tr.name or _lookup_tool_name(messages, i, tr.call_id)
                 response: dict[str, Any] = (
                     {"error": tr.output} if tr.is_error else {"output": tr.output}
                 )
@@ -521,9 +526,7 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
                     gtypes.Part(
                         function_response=gtypes.FunctionResponse(
                             id=tr.call_id,
-                            # name is required by the API but we only stored the call_id;
-                            # the model uses id for matching so name="" is acceptable.
-                            name="",
+                            name=name,
                             response=response,
                         )
                     )
@@ -543,6 +546,24 @@ def to_google_function_declaration(t: ToolSchema) -> Any:
         description=t.description,
         parameters_json_schema=t.input_schema,
     )
+
+
+def _lookup_tool_name(messages: list[Message], idx: int, call_id: str) -> str:
+    """Find the name of the ToolCall that produced the ToolResult at `idx`.
+
+    Walks backward through the message list, matching by call_id. Used when
+    folding for Google's API (which requires non-empty `name` on
+    FunctionResponse) and the ToolResult itself lacks it — old rows from
+    before ToolResult.name was added.
+    """
+
+    for j in range(idx - 1, -1, -1):
+        prev = messages[j]
+        if isinstance(prev, ToolCall) and prev.id == call_id:
+            return prev.name
+    # No matching ToolCall in history. Use the call_id as a last-resort
+    # placeholder so the request doesn't outright fail validation.
+    return call_id or "unknown_tool"
 
 
 async def _translate_google_stream(stream) -> AsyncIterator[ProviderEvent]:
@@ -575,7 +596,17 @@ async def _translate_google_stream(stream) -> AsyncIterator[ProviderEvent]:
                 fc_name = getattr(fc, "name", "") or ""
                 fc_args = getattr(fc, "args", None) or {}
                 fc_id = getattr(fc, "id", None) or f"gemini_{call_counter}"
-                yield ToolCallEvent(id=fc_id, name=fc_name, input=dict(fc_args))
+                # Gemini 2.5+ thinking models include a per-Part signature
+                # that we must preserve and echo back when this call reappears
+                # in conversation history. See:
+                # https://ai.google.dev/gemini-api/docs/thought-signatures
+                signature = getattr(part, "thought_signature", None)
+                yield ToolCallEvent(
+                    id=fc_id,
+                    name=fc_name,
+                    input=dict(fc_args),
+                    thought_signature=signature,
+                )
         fr = getattr(cand, "finish_reason", None)
         if fr is not None:
             stop_reason = _finish_reason_to_str(fr)

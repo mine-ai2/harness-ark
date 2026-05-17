@@ -124,6 +124,31 @@ def test_fold_assistant_text_and_tool_call_into_one_content():
     assert dict(fc.args) == {"path": "/x"}
 
 
+def test_fold_tool_call_echoes_thought_signature():
+    """Gemini 2.5+ thinking models reject calls echoed without their signature."""
+    sig = b"opaque thinking bytes"
+    contents = to_google_contents(
+        [
+            UserText(text="hi"),
+            ToolCall(
+                id="abc", name="fetch_url", input={"url": "x"}, thought_signature=sig
+            ),
+        ]
+    )
+    fc_part = contents[1].parts[0]
+    assert fc_part.thought_signature == sig
+
+
+def test_fold_tool_call_without_signature_omits_field():
+    """Non-Gemini calls (or pre-2.5 results) carry no signature; the Part
+    should simply not have one set."""
+    contents = to_google_contents(
+        [ToolCall(id="abc", name="fetch_url", input={"url": "x"})]
+    )
+    fc_part = contents[0].parts[0]
+    assert fc_part.thought_signature is None
+
+
 def test_fold_shared_file_into_model_role():
     contents = to_google_contents(
         [
@@ -139,13 +164,43 @@ def test_fold_shared_file_into_model_role():
 
 def test_fold_tool_result_into_user_function_response():
     contents = to_google_contents(
-        [ToolResult(call_id="abc", output="42")]
+        [ToolResult(call_id="abc", output="42", name="read_file")]
     )
     assert len(contents) == 1
     assert contents[0].role == "user"
     fr = contents[0].parts[0].function_response
     assert fr.id == "abc"
+    assert fr.name == "read_file"  # Google requires non-empty
     assert dict(fr.response) == {"output": "42"}
+
+
+def test_fold_tool_result_name_recovered_from_preceding_tool_call():
+    """Old rows in DB might lack ToolResult.name. The fold logic must look back
+    to the matching ToolCall to get a non-empty name (Google rejects empty)."""
+
+    contents = to_google_contents(
+        [
+            ToolCall(id="t1", name="fetch_url", input={"url": "https://x"}),
+            ToolResult(call_id="t1", output="page body"),  # no name set
+        ]
+    )
+    # contents[0] is the assistant turn (tool_call); contents[1] is the user
+    # turn (tool_result).
+    fr = contents[1].parts[0].function_response
+    assert fr.id == "t1"
+    assert fr.name == "fetch_url"
+
+
+def test_fold_tool_result_no_match_falls_back_to_call_id():
+    """If there's no matching ToolCall to look up (unusual but possible),
+    use the call_id so the API request still validates."""
+
+    contents = to_google_contents(
+        [ToolResult(call_id="orphan", output="x")]  # no preceding ToolCall
+    )
+    fr = contents[0].parts[0].function_response
+    # Must not be empty (Google rejects), so we use call_id as last resort
+    assert fr.name == "orphan"
 
 
 def test_fold_tool_result_error_flagged_in_response_dict():
@@ -159,13 +214,15 @@ def test_fold_tool_result_error_flagged_in_response_dict():
 def test_fold_multiple_tool_results_in_one_user_content():
     contents = to_google_contents(
         [
-            ToolResult(call_id="a", output="one"),
-            ToolResult(call_id="b", output="two"),
+            ToolResult(call_id="a", output="one", name="read_file"),
+            ToolResult(call_id="b", output="two", name="write_file"),
         ]
     )
     assert len(contents) == 1
     assert contents[0].role == "user"
     assert len(contents[0].parts) == 2
+    assert contents[0].parts[0].function_response.name == "read_file"
+    assert contents[0].parts[1].function_response.name == "write_file"
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +257,12 @@ def text_part(text):
     return ns(text=text, function_call=None)
 
 
-def fc_part(*, name, args, id=None):
-    return ns(text=None, function_call=ns(name=name, args=args, id=id))
+def fc_part(*, name, args, id=None, thought_signature=None):
+    return ns(
+        text=None,
+        function_call=ns(name=name, args=args, id=id),
+        thought_signature=thought_signature,
+    )
 
 
 @pytest.mark.asyncio
@@ -249,6 +310,23 @@ async def test_translate_tool_call_without_id_synthesizes_one():
     assert tcs[0].id.startswith("gemini_")  # synthesized
     assert tcs[0].name == "read_file"
     assert tcs[0].input == {"path": "a.txt"}
+
+
+@pytest.mark.asyncio
+async def test_translate_captures_thought_signature():
+    sig = b"signature-bytes"
+    chunks = [
+        chunk(
+            parts=[fc_part(name="fetch_url", args={"url": "x"}, id="t1", thought_signature=sig)],
+            finish_reason=ns(value="STOP"),
+        )
+    ]
+    out = []
+    async for evt in _translate_google_stream(_FakeStream(chunks)):
+        out.append(evt)
+    tcs = [e for e in out if isinstance(e, ToolCallEvent)]
+    assert len(tcs) == 1
+    assert tcs[0].thought_signature == sig
 
 
 @pytest.mark.asyncio
