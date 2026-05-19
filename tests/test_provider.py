@@ -107,6 +107,14 @@ def test_tool_schema_conversion():
 # ---------------------------------------------------------------------------
 
 
+def _drop_usage(events):
+    """Tests below pre-date TurnUsageEvent. Drop those events for backwards
+    compatibility — usage extraction has its own coverage."""
+    from ark.types import TurnUsageEvent
+
+    return [e for e in events if not isinstance(e, TurnUsageEvent)]
+
+
 def test_translate_text_and_tool_call():
     events = [
         evt(type="message_start"),
@@ -124,7 +132,7 @@ def test_translate_text_and_tool_call():
         evt(type="message_delta", delta=evt(stop_reason="tool_use")),
         evt(type="message_stop"),
     ]
-    out = list(translate_stream(events))
+    out = _drop_usage(list(translate_stream(events)))
     assert out == [
         TextDelta(text="Hi"),
         TextDelta(text=" there"),
@@ -144,7 +152,7 @@ def test_translate_thinking_delta():
         evt(type="message_delta", delta=evt(stop_reason="end_turn")),
         evt(type="message_stop"),
     ]
-    out = list(translate_stream(events))
+    out = _drop_usage(list(translate_stream(events)))
     assert out == [
         ThinkingDelta(text="hmm"),
         TextDelta(text="ok"),
@@ -159,8 +167,33 @@ def test_translate_handles_empty_tool_input():
         evt(type="message_delta", delta=evt(stop_reason="tool_use")),
         evt(type="message_stop"),
     ]
-    out = list(translate_stream(events))
+    out = _drop_usage(list(translate_stream(events)))
     assert out == [
         ToolCallEvent(id="t", name="n", input={}),
         AssistantTurnEnd(text="", stop_reason="tool_use"),
     ]
+
+
+def test_translate_emits_usage_event_with_token_counts():
+    """message_start gives input_tokens; message_delta gives output_tokens.
+    The resulting TurnUsageEvent should reflect both."""
+    from ark.types import TurnUsageEvent
+
+    events = [
+        evt(type="message_start", message=evt(usage=evt(input_tokens=420, output_tokens=0))),
+        evt(type="content_block_start", content_block=evt(type="text")),
+        evt(type="content_block_delta", delta=evt(type="text_delta", text="hi")),
+        evt(type="content_block_stop"),
+        evt(
+            type="message_delta",
+            delta=evt(stop_reason="end_turn"),
+            usage=evt(output_tokens=7),
+        ),
+        evt(type="message_stop"),
+    ]
+    out = list(translate_stream(events, model="claude-sonnet-4-6"))
+    usage = [e for e in out if isinstance(e, TurnUsageEvent)]
+    assert len(usage) == 1
+    assert usage[0].input_tokens == 420
+    assert usage[0].output_tokens == 7
+    assert usage[0].model == "claude-sonnet-4-6"

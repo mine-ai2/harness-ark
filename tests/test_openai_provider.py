@@ -103,9 +103,11 @@ class _FakeStream:
 
 @pytest.mark.asyncio
 async def test_translate_text_and_tool_call_stream():
+    from ark.types import TurnUsageEvent
+
     chunks = [
-        ns(choices=[ns(delta=ns(content="Hi", tool_calls=None), finish_reason=None)]),
-        ns(choices=[ns(delta=ns(content=" there", tool_calls=None), finish_reason=None)]),
+        ns(choices=[ns(delta=ns(content="Hi", tool_calls=None), finish_reason=None)], usage=None),
+        ns(choices=[ns(delta=ns(content=" there", tool_calls=None), finish_reason=None)], usage=None),
         ns(
             choices=[
                 ns(
@@ -121,7 +123,8 @@ async def test_translate_text_and_tool_call_stream():
                     ),
                     finish_reason=None,
                 )
-            ]
+            ],
+            usage=None,
         ),
         ns(
             choices=[
@@ -138,7 +141,8 @@ async def test_translate_text_and_tool_call_stream():
                     ),
                     finish_reason=None,
                 )
-            ]
+            ],
+            usage=None,
         ),
         ns(
             choices=[
@@ -146,15 +150,26 @@ async def test_translate_text_and_tool_call_stream():
                     delta=ns(content=None, tool_calls=None),
                     finish_reason="tool_calls",
                 )
-            ]
+            ],
+            usage=None,
         ),
+        # Final usage chunk has no choices, only `usage` (when stream_options.include_usage is set)
+        ns(choices=[], usage=ns(prompt_tokens=42, completion_tokens=7)),
     ]
     out = []
-    async for evt in _translate_openai_stream(_FakeStream(chunks)):
+    async for evt in _translate_openai_stream(_FakeStream(chunks), model="gpt-5"):
         out.append(evt)
-    assert out == [
+    # Strip usage for the existing assertion shape
+    out_no_usage = [e for e in out if not isinstance(e, TurnUsageEvent)]
+    assert out_no_usage == [
         TextDelta(text="Hi"),
         TextDelta(text=" there"),
         ToolCallEvent(id="call_1", name="read_file", input={"path": "a.txt"}),
         AssistantTurnEnd(text="Hi there", stop_reason="tool_calls"),
     ]
+    # And the usage event must be present, populated from the final chunk
+    usage = [e for e in out if isinstance(e, TurnUsageEvent)]
+    assert len(usage) == 1
+    assert usage[0].input_tokens == 42
+    assert usage[0].output_tokens == 7
+    assert usage[0].model == "gpt-5"

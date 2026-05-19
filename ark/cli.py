@@ -140,6 +140,31 @@ class _Ui:
         sys.stderr.write(f"\033[31m{text}\033[0m\n")
         sys.stderr.flush()
 
+    def usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        context_window: int | None,
+        model: str,
+    ) -> None:
+        """Dim per-turn token-usage indicator."""
+        self._wipe_status()
+        if self.text_pending_newline:
+            sys.stdout.write("\n")
+            self.text_pending_newline = False
+        if context_window and context_window > 0:
+            pct = input_tokens / context_window * 100
+            msg = (
+                f"{input_tokens:,}/{context_window:,} ctx ({pct:.1f}%)"
+                f" · out {output_tokens:,}"
+            )
+        else:
+            msg = f"in {input_tokens:,} · out {output_tokens:,}"
+        if model:
+            msg += f" · {model}"
+        sys.stderr.write(f"\033[2m[{msg}]\033[0m\n")
+        sys.stderr.flush()
+
     def done(self) -> None:
         self._wipe_status()
         self.assistant_turn_end()
@@ -187,8 +212,27 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             preview = (evt.get("output") or "").splitlines()[0][:80] if evt.get("output") else ""
             ui.error_line(f"[tool error: {preview}]" if preview else "[tool error]")
         ui.status("thinking")
+    elif t == "turn_usage":
+        ui.usage(
+            int(evt.get("input_tokens", 0)),
+            int(evt.get("output_tokens", 0)),
+            evt.get("context_window"),
+            evt.get("model") or "",
+        )
     elif t == "error":
-        ui.error_line(f"[server error: {evt.get('message')}]")
+        code = evt.get("code") or "other"
+        msg = evt.get("message") or ""
+        if code == "context_too_long":
+            ui.error_line(
+                "[context too long — this session has exceeded the model's input "
+                "window. Start a new session to continue.]"
+            )
+        elif code == "rate_limit":
+            ui.error_line(f"[rate limited by provider — try again shortly. {msg[:120]}]")
+        elif code == "auth":
+            ui.error_line(f"[auth failure — check your provider API key. {msg[:120]}]")
+        else:
+            ui.error_line(f"[server error: {msg}]")
     elif t == "done":
         ui.done()
 

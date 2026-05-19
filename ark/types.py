@@ -80,6 +80,28 @@ class SessionContext:
     text: str
 
 
+@dataclass
+class TurnMetrics:
+    """Per-turn telemetry: token counts reported by the provider.
+
+    Persisted in session history so total session cost / context fill can be
+    computed later. NOT sent to the LLM as a conversation turn — the runtime
+    filters these out before passing the message list to the provider."""
+
+    input_tokens: int
+    output_tokens: int
+    model: str = ""
+
+
+@dataclass
+class RunError:
+    """A classified failure during a turn. Persisted so clients (and humans
+    looking at the session later) can see what went wrong and where."""
+
+    code: str  # one of: context_too_long, rate_limit, auth, other
+    message: str
+
+
 Message = Union[
     UserText,
     AssistantText,
@@ -88,6 +110,8 @@ Message = Union[
     UploadMessage,
     SharedFile,
     SessionContext,
+    TurnMetrics,
+    RunError,
 ]
 
 
@@ -148,9 +172,39 @@ class RunEnd:
     stop_reason: str | None = None
 
 
-ProviderEvent = Union[TextDelta, ThinkingDelta, ToolCallEvent, AssistantTurnEnd]
+@dataclass
+class TurnUsageEvent:
+    """Token counts reported by the provider for the just-completed turn.
+
+    Yielded by provider adapters just before AssistantTurnEnd. The runtime
+    persists this as a TurnMetrics message and forwards it to the client."""
+
+    input_tokens: int
+    output_tokens: int
+    model: str = ""
+    context_window: int | None = None  # provider's known max, if any
+
+
+@dataclass
+class RunErrorEvent:
+    """Classified provider failure, surfaced to clients with an actionable code."""
+
+    code: str  # one of: context_too_long, rate_limit, auth, other
+    message: str
+
+
+ProviderEvent = Union[
+    TextDelta, ThinkingDelta, ToolCallEvent, AssistantTurnEnd, TurnUsageEvent
+]
 RuntimeEvent = Union[
-    TextDelta, ThinkingDelta, ToolCallEvent, ToolResultEvent, AssistantTurnEnd, RunEnd
+    TextDelta,
+    ThinkingDelta,
+    ToolCallEvent,
+    ToolResultEvent,
+    AssistantTurnEnd,
+    RunEnd,
+    TurnUsageEvent,
+    RunErrorEvent,
 ]
 
 
@@ -196,6 +250,14 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
         }
     if isinstance(msg, SessionContext):
         return "session_context", {"text": msg.text}
+    if isinstance(msg, TurnMetrics):
+        return "turn_metrics", {
+            "input_tokens": msg.input_tokens,
+            "output_tokens": msg.output_tokens,
+            "model": msg.model,
+        }
+    if isinstance(msg, RunError):
+        return "run_error", {"code": msg.code, "message": msg.message}
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -234,4 +296,12 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
         )
     if role == "session_context":
         return SessionContext(text=content["text"])
+    if role == "turn_metrics":
+        return TurnMetrics(
+            input_tokens=int(content.get("input_tokens", 0)),
+            output_tokens=int(content.get("output_tokens", 0)),
+            model=content.get("model", ""),
+        )
+    if role == "run_error":
+        return RunError(code=content.get("code", "other"), message=content.get("message", ""))
     raise ValueError(f"unknown role: {role}")

@@ -250,6 +250,7 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `model` | string | yes | Provider-specific model id. |
 | `workspace` | string | no | Absolute path the agent treats as its working directory. Defaults to `<ARK_HOME>/agents/<name>/workspace`. `~` is expanded. |
 | `always_loaded_skills` | string[] | no | Names of skills whose tool schemas are exposed on every session start. Skills not in this list are still discoverable via `list_skills()` / `load_skill()`. |
+| `max_context_tokens` | int | no | Override the model's input-token ceiling for the usage indicator. Falls back to the table in [ark/models.py](../ark/models.py). Set when you want to override the default (e.g. opt into Anthropic's 1M-token beta — `1000000`) or when the model isn't in the table. |
 
 Two files live alongside each agent's config — Ark creates them on
 `init` / `serve` if missing, and you edit them as part of agent design:

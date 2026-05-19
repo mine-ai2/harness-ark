@@ -27,6 +27,7 @@ from .types import (
     ToolCallEvent,
     ToolResult,
     ToolSchema,
+    TurnUsageEvent,
     UploadMessage,
     UserText,
 )
@@ -90,12 +91,21 @@ class AnthropicProvider:
         state = _State()
         async with self._client.messages.stream(**kwargs) as stream:
             async for event in stream:
-                for translated in _translate(event, state):
+                for translated in _translate(event, state, model):
                     yield translated
 
 
 class _State:
-    __slots__ = ("block_type", "tool_id", "tool_name", "tool_json", "text_buf", "stop_reason")
+    __slots__ = (
+        "block_type",
+        "tool_id",
+        "tool_name",
+        "tool_json",
+        "text_buf",
+        "stop_reason",
+        "input_tokens",
+        "output_tokens",
+    )
 
     def __init__(self) -> None:
         self.block_type: str | None = None
@@ -104,6 +114,8 @@ class _State:
         self.tool_json: str = ""
         self.text_buf: str = ""
         self.stop_reason: str | None = None
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
 
 
 def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -173,7 +185,7 @@ def to_anthropic_tool(t: ToolSchema) -> dict[str, Any]:
     }
 
 
-def translate_stream(events: Iterable[Any]) -> Iterable[ProviderEvent]:
+def translate_stream(events: Iterable[Any], model: str = "") -> Iterable[ProviderEvent]:
     """Convert raw Anthropic stream events into normalized ProviderEvents.
 
     Pulled out as a sync helper over a regular iterable so it can be unit-tested
@@ -182,12 +194,19 @@ def translate_stream(events: Iterable[Any]) -> Iterable[ProviderEvent]:
 
     state = _State()
     for event in events:
-        yield from _translate(event, state)
+        yield from _translate(event, state, model)
 
 
-def _translate(event: Any, state: _State) -> Iterable[ProviderEvent]:
+def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderEvent]:
     et = getattr(event, "type", None)
-    if et == "content_block_start":
+    if et == "message_start":
+        # Initial usage (input tokens) lives on the message_start envelope.
+        msg = getattr(event, "message", None)
+        usage = getattr(msg, "usage", None) if msg is not None else None
+        if usage is not None:
+            state.input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            state.output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    elif et == "content_block_start":
         cb = getattr(event, "content_block", None)
         if cb is None:
             return
@@ -236,10 +255,24 @@ def _translate(event: Any, state: _State) -> Iterable[ProviderEvent]:
             sr = getattr(delta, "stop_reason", None)
             if sr:
                 state.stop_reason = sr
+        # Output-tokens cumulative count lives on usage of the message_delta
+        # event itself (not on `delta`).
+        usage = getattr(event, "usage", None)
+        if usage is not None:
+            out = getattr(usage, "output_tokens", None)
+            if out is not None:
+                state.output_tokens = int(out)
     elif et == "message_stop":
+        yield TurnUsageEvent(
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            model=model,
+        )
         yield AssistantTurnEnd(text=state.text_buf, stop_reason=state.stop_reason)
         state.text_buf = ""
         state.stop_reason = None
+        state.input_tokens = 0
+        state.output_tokens = 0
 
 
 # ---------------------------------------------------------------------------
@@ -267,16 +300,18 @@ class OpenAIProvider:
         api_tools = [to_openai_tool(t) for t in tools] or None
         # `max_completion_tokens` is the modern field; reasoning models (gpt-5, o1,
         # o3) reject `max_tokens` outright. Older models accept both.
+        # `stream_options.include_usage` gets us token counts in a final chunk.
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": api_messages,
             "max_completion_tokens": max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if api_tools:
             kwargs["tools"] = api_tools
         stream = await self._client.chat.completions.create(**kwargs)
-        async for evt in _translate_openai_stream(stream):
+        async for evt in _translate_openai_stream(stream, model=model):
             yield evt
 
 
@@ -362,19 +397,27 @@ def to_openai_tool(t: ToolSchema) -> dict[str, Any]:
     }
 
 
-async def _translate_openai_stream(stream) -> AsyncIterator[ProviderEvent]:
+async def _translate_openai_stream(stream, model: str = "") -> AsyncIterator[ProviderEvent]:
     """Convert OpenAI streaming chunks to normalized ProviderEvents.
 
     OpenAI tool-call deltas come keyed by `index`; we assemble them up before
-    emitting the ToolCallEvent at end-of-stream.
+    emitting the ToolCallEvent at end-of-stream. Usage arrives on a final
+    chunk when `stream_options.include_usage` was requested.
     """
 
     text_buf = ""
     stop_reason: str | None = None
+    input_tokens = 0
+    output_tokens = 0
     # index -> {id, name, args}
     tool_calls: dict[int, dict[str, Any]] = {}
 
     async for chunk in stream:
+        # The usage chunk has no choices and is emitted after the content.
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         if not chunk.choices:
             continue
         choice = chunk.choices[0]
@@ -409,6 +452,9 @@ async def _translate_openai_stream(stream) -> AsyncIterator[ProviderEvent]:
             name=slot["name"] or "",
             input=parsed,
         )
+    yield TurnUsageEvent(
+        input_tokens=input_tokens, output_tokens=output_tokens, model=model
+    )
     yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
 
 
@@ -463,7 +509,7 @@ class GoogleProvider:
         stream = await self._client.aio.models.generate_content_stream(
             model=model, contents=contents, config=config
         )
-        async for evt in _translate_google_stream(stream):
+        async for evt in _translate_google_stream(stream, model=model):
             yield evt
 
 
@@ -566,19 +612,27 @@ def _lookup_tool_name(messages: list[Message], idx: int, call_id: str) -> str:
     return call_id or "unknown_tool"
 
 
-async def _translate_google_stream(stream) -> AsyncIterator[ProviderEvent]:
+async def _translate_google_stream(stream, model: str = "") -> AsyncIterator[ProviderEvent]:
     """Convert Google's GenerateContentResponse chunks to normalized events.
 
     Google yields one chunk per content delta. Each chunk's
     `candidates[0].content.parts` may contain `text` and/or `function_call`
     parts; we emit a TextDelta for each text part and a ToolCallEvent for
     each fully-formed function_call. `finish_reason` lands on the last chunk.
+    `usage_metadata` is cumulative — we keep the last one and emit it as a
+    TurnUsageEvent at the end.
     """
 
     text_buf = ""
     stop_reason: str | None = None
     call_counter = 0
+    input_tokens = 0
+    output_tokens = 0
     async for chunk in stream:
+        um = getattr(chunk, "usage_metadata", None)
+        if um is not None:
+            input_tokens = int(getattr(um, "prompt_token_count", 0) or 0)
+            output_tokens = int(getattr(um, "candidates_token_count", 0) or 0)
         candidates = getattr(chunk, "candidates", None) or []
         if not candidates:
             continue
@@ -610,6 +664,9 @@ async def _translate_google_stream(stream) -> AsyncIterator[ProviderEvent]:
         fr = getattr(cand, "finish_reason", None)
         if fr is not None:
             stop_reason = _finish_reason_to_str(fr)
+    yield TurnUsageEvent(
+        input_tokens=input_tokens, output_tokens=output_tokens, model=model
+    )
     yield AssistantTurnEnd(text=text_buf, stop_reason=stop_reason)
 
 

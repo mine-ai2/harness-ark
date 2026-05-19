@@ -38,6 +38,9 @@ class AgentConfig:
     model: str
     workspace: Path
     always_loaded_skills: list[str] = field(default_factory=list)
+    # Override for the model's input-token ceiling. Optional — falls back to
+    # the table in ark.models. Used purely to compute the usage indicator.
+    max_context_tokens: int | None = None
 
 
 @dataclass
@@ -127,11 +130,17 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.always_loaded_skills must be a list of strings"
             )
+        max_ctx = cfg.get("max_context_tokens")
+        if max_ctx is not None and (not isinstance(max_ctx, int) or max_ctx <= 0):
+            raise ConfigError(
+                f"agents.{name}.max_context_tokens must be a positive integer if set"
+            )
         out[name] = AgentConfig(
             name=name,
             provider=provider,
             model=cfg["model"],
             workspace=workspace,
             always_loaded_skills=list(skills),
+            max_context_tokens=max_ctx,
         )
     return out

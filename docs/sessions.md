@@ -152,10 +152,11 @@ Quick summary of the event shapes the client sees:
 | `{ "type": "thinking", "delta": ... }` | Extended-thinking text (Gemini/Anthropic) |
 | `{ "type": "tool_call", "id", "name", "input" }` | Model invoked a tool |
 | `{ "type": "tool_result", "id", "output", "error" }` | Tool returned |
+| `{ "type": "turn_usage", "input_tokens", "output_tokens", "model", "context_window" }` | Per-turn token counts. `context_window` is the model's input ceiling (null if unknown). See [Usage tracking](#usage-tracking) below. |
 | `{ "type": "file_available", "path", "description", "size" }` | Agent shared a file (see [files.md](files.md)) |
 | `{ "type": "injected_message", "from_session_id", "text" }` | Another session injected a message |
-| `{ "type": "error", "message" }` | Server error during the turn |
-| `{ "type": "done", "stop_reason" }` | Whole run-loop finished, awaiting next user input |
+| `{ "type": "error", "code", "message" }` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
+| `{ "type": "done", "stop_reason" }` | Whole run-loop finished, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
 
 | Client → server | Effect |
 |---|---|
@@ -164,6 +165,62 @@ Quick summary of the event shapes the client sees:
 
 Per-session context is **not** added over the WS — it's a REST operation
 even mid-chat. The CLI does the REST call when you type `/context ...`.
+
+## Usage tracking
+
+Every provider call (every iteration of the model→tools→model loop within
+a user turn) emits a `turn_usage` event with token counts pulled from the
+provider's response metadata. Two consumers:
+
+- **Live UI**. The CLI prints a dim indicator after each turn:
+  `[12,440/200,000 ctx (6.2%) · out 348 · claude-sonnet-4-6]`. When the
+  model's context ceiling is unknown, the percentage is omitted.
+- **Persistent record**. Each event is also written to the session's
+  message log as a `TurnMetrics` row. These rows are filtered out before
+  the message list is sent to the next provider call (they're telemetry,
+  not conversation), but `GET /history` returns them so clients can sum
+  token usage across a session.
+
+**Context-ceiling source of truth.** The harness ships a small table of
+known model → max input tokens in [ark/models.py](../ark/models.py).
+You can override per-agent in config:
+
+```json
+"agents": {
+  "scribe": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "max_context_tokens": 1000000   // opt into Anthropic's 1M beta
+  }
+}
+```
+
+If neither the table nor a config override has a value, `context_window`
+is `null` in the event and the CLI shows raw counts only.
+
+**No compaction in v1.** When a session's accumulated input would exceed
+the model's window, the provider returns an error, the runtime classifies
+it as `context_too_long` and records it as a `RunError` in history. The
+CLI surfaces this with an actionable message. Recovery is "start a new
+session." Compaction / summarization is a separate piece of work.
+
+## Error tracking
+
+Provider exceptions are caught inside `run_user_turn`, classified into one
+of four codes, persisted as a `RunError` message, and surfaced over the WS
+as an `error` event:
+
+| Code | Triggered by |
+|---|---|
+| `context_too_long` | "context length exceeded" / "prompt is too long" / "input is too long" from any provider |
+| `rate_limit` | 429s, "rate limit" in the message, or a `RateLimit*` exception type |
+| `auth` | 401s, "authentication" / "invalid api key" in the message, or `Authentication*` exception types |
+| `other` | Anything else |
+
+After an error, the run loop ends with `stop_reason: "error:<code>"`. The
+session is not deleted — history is fully readable and you can attempt
+another turn (which will likely hit the same problem until you act on the
+code).
 
 ## Cross-session messaging
 

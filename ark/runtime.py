@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from . import paths, tools
+from . import models, paths, tools
 from .config import AgentConfig, Config
 from .provider import AnthropicProvider, Provider
 from .types import (
@@ -16,6 +16,8 @@ from .types import (
     AssistantTurnEnd,
     Message,
     RunEnd,
+    RunError,
+    RunErrorEvent,
     RuntimeEvent,
     SessionContext,
     TextDelta,
@@ -24,6 +26,8 @@ from .types import (
     ToolCallEvent,
     ToolResult,
     ToolResultEvent,
+    TurnMetrics,
+    TurnUsageEvent,
     UserText,
     message_from_row,
     message_to_row,
@@ -201,6 +205,43 @@ def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
     ).fetchone()[0]
 
 
+def classify_provider_error(exc: Exception) -> tuple[str, str]:
+    """Map a provider exception to (code, message) for client surfacing.
+
+    Codes: 'context_too_long' | 'rate_limit' | 'auth' | 'other'. The match is
+    intentionally loose — uses both exception class name and message text so
+    it works across Anthropic, OpenAI, OpenRouter (OpenAI-shaped), and Google
+    without coupling to their import paths.
+    """
+
+    name = type(exc).__name__
+    raw = str(exc)
+    low = raw.lower()
+    context_hits = (
+        "context_length_exceeded",
+        "context length",
+        "prompt is too long",
+        "input is too long",
+        "input token count",
+        "exceeds the model's context",
+        "exceeds the maximum context",
+        "maximum context length",
+    )
+    if any(k in low for k in context_hits):
+        return "context_too_long", raw
+    if "RateLimit" in name or "rate limit" in low or "rate_limit" in low or "429" in raw:
+        return "rate_limit", raw
+    if (
+        "Authentication" in name
+        or "Unauthorized" in name
+        or "401" in raw
+        or "invalid api key" in low
+        or "invalid_api_key" in low
+    ):
+        return "auth", raw
+    return "other", raw
+
+
 # ---------------------------------------------------------------------------
 # Turn loop
 # ---------------------------------------------------------------------------
@@ -227,48 +268,79 @@ async def run_user_turn(
         base_url=provider_cfg.base_url,
     )
     skills_for_session = loaded_skills(session_id)
+    context_window = models.context_window_for(
+        agent.model, agent.max_context_tokens
+    )
 
     last_stop_reason: str | None = None
+    # Message kinds that exist as session-history metadata but must NOT be
+    # passed to the LLM as conversation turns (system_prompt material,
+    # telemetry, or recorded errors).
+    _llm_excluded = (SessionContext, TurnMetrics, RunError)
     for _ in range(max_iterations):
         history = load_history(conn, session_id)
-        # SessionContext messages go to the system prompt, not the turn list.
         contexts = [m for m in history if isinstance(m, SessionContext)]
-        turn_messages = [m for m in history if not isinstance(m, SessionContext)]
+        turn_messages = [m for m in history if not isinstance(m, _llm_excluded)]
         system = system_prompt(agent, contexts)
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
         turn_text = ""
 
-        async for evt in provider.stream_turn(
-            model=agent.model,
-            system=system,
-            messages=turn_messages,
-            tools=active,
-        ):
-            if isinstance(evt, TextDelta):
-                turn_text += evt.text
-                yield evt
-            elif isinstance(evt, ThinkingDelta):
-                yield evt
-            elif isinstance(evt, ToolCallEvent):
-                pending_tool_calls.append(evt)
-                yield evt
-            elif isinstance(evt, AssistantTurnEnd):
-                last_stop_reason = evt.stop_reason
-                if turn_text:
-                    append_message(conn, session_id, AssistantText(text=turn_text))
-                for tc in pending_tool_calls:
+        try:
+            async for evt in provider.stream_turn(
+                model=agent.model,
+                system=system,
+                messages=turn_messages,
+                tools=active,
+            ):
+                if isinstance(evt, TextDelta):
+                    turn_text += evt.text
+                    yield evt
+                elif isinstance(evt, ThinkingDelta):
+                    yield evt
+                elif isinstance(evt, ToolCallEvent):
+                    pending_tool_calls.append(evt)
+                    yield evt
+                elif isinstance(evt, TurnUsageEvent):
                     append_message(
                         conn,
                         session_id,
-                        ToolCall(
-                            id=tc.id,
-                            name=tc.name,
-                            input=tc.input,
-                            thought_signature=tc.thought_signature,
+                        TurnMetrics(
+                            input_tokens=evt.input_tokens,
+                            output_tokens=evt.output_tokens,
+                            model=evt.model or agent.model,
                         ),
                     )
-                yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
+                    # Re-emit with the agent's known context_window so the
+                    # client can show a percentage.
+                    yield TurnUsageEvent(
+                        input_tokens=evt.input_tokens,
+                        output_tokens=evt.output_tokens,
+                        model=evt.model or agent.model,
+                        context_window=context_window,
+                    )
+                elif isinstance(evt, AssistantTurnEnd):
+                    last_stop_reason = evt.stop_reason
+                    if turn_text:
+                        append_message(conn, session_id, AssistantText(text=turn_text))
+                    for tc in pending_tool_calls:
+                        append_message(
+                            conn,
+                            session_id,
+                            ToolCall(
+                                id=tc.id,
+                                name=tc.name,
+                                input=tc.input,
+                                thought_signature=tc.thought_signature,
+                            ),
+                        )
+                    yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
+        except Exception as exc:  # noqa: BLE001
+            code, message = classify_provider_error(exc)
+            append_message(conn, session_id, RunError(code=code, message=message))
+            yield RunErrorEvent(code=code, message=message)
+            yield RunEnd(stop_reason=f"error:{code}")
+            return
 
         if not pending_tool_calls:
             yield RunEnd(stop_reason=last_stop_reason)

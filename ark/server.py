@@ -18,10 +18,12 @@ from .scheduler import Scheduler
 from .types import (
     AssistantTurnEnd,
     RunEnd,
+    RunErrorEvent,
     TextDelta,
     ThinkingDelta,
     ToolCallEvent,
     ToolResultEvent,
+    TurnUsageEvent,
     UploadMessage,
 )
 
@@ -363,6 +365,16 @@ def _event_to_wire(evt: Any) -> dict:
             "output": evt.output,
             "error": evt.is_error,
         }
+    if isinstance(evt, TurnUsageEvent):
+        return {
+            "type": "turn_usage",
+            "input_tokens": evt.input_tokens,
+            "output_tokens": evt.output_tokens,
+            "model": evt.model,
+            "context_window": evt.context_window,
+        }
+    if isinstance(evt, RunErrorEvent):
+        return {"type": "error", "code": evt.code, "message": evt.message}
     if isinstance(evt, RunEnd):
         return {"type": "done", "stop_reason": evt.stop_reason}
     if is_dataclass(evt):

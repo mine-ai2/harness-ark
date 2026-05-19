@@ -246,11 +246,17 @@ def ns(**kwargs):
     return SimpleNamespace(**kwargs)
 
 
-def chunk(parts=(), finish_reason=None):
+def chunk(parts=(), finish_reason=None, usage_metadata=None):
     """Build a fake GenerateContentResponse chunk."""
     content = ns(parts=list(parts)) if parts else None
     candidate = ns(content=content, finish_reason=finish_reason)
-    return ns(candidates=[candidate])
+    return ns(candidates=[candidate], usage_metadata=usage_metadata)
+
+
+def _drop_usage(events):
+    from ark.types import TurnUsageEvent
+
+    return [e for e in events if not isinstance(e, TurnUsageEvent)]
 
 
 def text_part(text):
@@ -275,7 +281,7 @@ async def test_translate_text_only_stream():
     out = []
     async for evt in _translate_google_stream(_FakeStream(chunks)):
         out.append(evt)
-    assert out == [
+    assert _drop_usage(out) == [
         TextDelta(text="Hi"),
         TextDelta(text=" there"),
         AssistantTurnEnd(text="Hi there", stop_reason="stop"),
@@ -293,7 +299,7 @@ async def test_translate_tool_call_with_id():
     out = []
     async for evt in _translate_google_stream(_FakeStream(chunks)):
         out.append(evt)
-    assert out == [
+    assert _drop_usage(out) == [
         ToolCallEvent(id="call-1", name="read_file", input={"path": "a.txt"}),
         AssistantTurnEnd(text="", stop_reason="stop"),
     ]
@@ -341,11 +347,32 @@ async def test_translate_text_and_tool_call_interleaved():
     out = []
     async for evt in _translate_google_stream(_FakeStream(chunks)):
         out.append(evt)
-    assert out == [
+    assert _drop_usage(out) == [
         TextDelta(text="checking…"),
         ToolCallEvent(id="t1", name="read_file", input={"path": "a"}),
         AssistantTurnEnd(text="checking…", stop_reason="stop"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_translate_captures_usage_metadata():
+    from ark.types import TurnUsageEvent
+
+    chunks = [
+        chunk(parts=[text_part("ok")]),
+        chunk(
+            finish_reason=ns(value="STOP"),
+            usage_metadata=ns(prompt_token_count=512, candidates_token_count=11),
+        ),
+    ]
+    out = []
+    async for evt in _translate_google_stream(_FakeStream(chunks), model="gemini-2.5-pro"):
+        out.append(evt)
+    usage = [e for e in out if isinstance(e, TurnUsageEvent)]
+    assert len(usage) == 1
+    assert usage[0].input_tokens == 512
+    assert usage[0].output_tokens == 11
+    assert usage[0].model == "gemini-2.5-pro"
 
 
 @pytest.mark.asyncio
