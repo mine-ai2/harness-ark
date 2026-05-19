@@ -17,6 +17,7 @@ from .types import (
     Message,
     RunEnd,
     RuntimeEvent,
+    SessionContext,
     TextDelta,
     ThinkingDelta,
     ToolCall,
@@ -142,10 +143,17 @@ def append_message(conn: sqlite3.Connection, session_id: str, msg: Message) -> N
 # ---------------------------------------------------------------------------
 
 
-def system_prompt(agent: AgentConfig) -> str:
-    """Build the system prompt: the user's session_context.md followed by a
-    runtime-injected Environment stanza so the model has concrete grounding for
-    file/shell tool calls."""
+def system_prompt(
+    agent: AgentConfig, contexts: list[SessionContext] | None = None
+) -> str:
+    """Build the system prompt.
+
+    Layers (top to bottom):
+      1. The user's `session_context.md` — agent identity / persona
+      2. The Environment stanza — runtime facts (workspace path, available
+         file/shell/upload helpers)
+      3. Any client-supplied SessionContext messages, concatenated in order
+    """
 
     ctx_path = paths.agent_dir(agent.name) / "session_context.md"
     body = (
@@ -169,7 +177,28 @@ def system_prompt(agent: AgentConfig) -> str:
         "and then call `share_with_client(path)`. The user's client will be "
         "notified and given a download link.\n"
     )
-    return body + env
+    out = body + env
+    if contexts:
+        joined = "\n\n".join(c.text for c in contexts if c.text.strip())
+        if joined:
+            out += (
+                "\n\n---\n"
+                "Session context (provided by the client for this session — "
+                "additive, do not override the agent context above):\n"
+                + joined
+                + "\n"
+            )
+    return out
+
+
+def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
+    """Append a SessionContext message to a session. Returns the new total."""
+
+    append_message(conn, session_id, SessionContext(text=text))
+    return conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'session_context'",
+        (session_id,),
+    ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -197,12 +226,15 @@ async def run_user_turn(
         api_key=provider_cfg.api_key,
         base_url=provider_cfg.base_url,
     )
-    system = system_prompt(agent)
     skills_for_session = loaded_skills(session_id)
 
     last_stop_reason: str | None = None
     for _ in range(max_iterations):
         history = load_history(conn, session_id)
+        # SessionContext messages go to the system prompt, not the turn list.
+        contexts = [m for m in history if isinstance(m, SessionContext)]
+        turn_messages = [m for m in history if not isinstance(m, SessionContext)]
+        system = system_prompt(agent, contexts)
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
         turn_text = ""
@@ -210,7 +242,7 @@ async def run_user_turn(
         async for evt in provider.stream_turn(
             model=agent.model,
             system=system,
-            messages=history,
+            messages=turn_messages,
             tools=active,
         ):
             if isinstance(evt, TextDelta):

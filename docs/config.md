@@ -304,7 +304,8 @@ runtime state or out of v1 scope:
 | Heartbeat interval | `agent_state` table | `ark heartbeat <agent> <seconds>` (CLI), `PUT /agents/<name>/heartbeat` (REST), or `set_heartbeat` tool (agent) |
 | Cron entries | `crons` table | `ark cron set/list/remove ...` (CLI), `PUT/GET/DELETE /agents/<name>/crons/...` (REST), or `add_cron`/`remove_cron`/`list_crons` tools (agent) |
 | Skill code | `<ARK_HOME>/skills/*.py` and `<ARK_HOME>/agents/<name>/skills/*.py` | Drop files in directly; restart server to pick up changes |
-| Session context | `<ARK_HOME>/agents/<name>/session_context.md` | Edit the file; new sessions see the new prompt |
+| Agent-wide session context (persona) | `<ARK_HOME>/agents/<name>/session_context.md` | Edit the file; new sessions see the new prompt |
+| Per-session context (client-supplied) | `messages` table, role `session_context` | REST: `POST /agents/<name>/sessions/<sid>/context`; CLI: `ark chat ... --context` or `/context` mid-chat. See [sessions.md](sessions.md) |
 | Heartbeat prompt | `<ARK_HOME>/agents/<name>/heartbeat_prompt.md` | Edit the file; next heartbeat uses the new prompt |
 | Per-call token limits | not configurable in v1 | `max_tokens` is hardcoded to 4096 in `provider.py` |
 | Logging level | not configurable in v1 | Uvicorn defaults; tweak via env vars at process start if needed |

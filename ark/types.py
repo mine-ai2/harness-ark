@@ -69,7 +69,26 @@ class SharedFile:
     size: int = 0
 
 
-Message = Union[UserText, AssistantText, ToolCall, ToolResult, UploadMessage, SharedFile]
+@dataclass
+class SessionContext:
+    """Client-supplied per-session instructions, layered onto the system prompt.
+
+    Append-only: multiple SessionContext messages accumulate over the life of
+    the session. They are NOT sent to the LLM as conversation turns — the
+    runtime extracts them and appends to the system prompt instead."""
+
+    text: str
+
+
+Message = Union[
+    UserText,
+    AssistantText,
+    ToolCall,
+    ToolResult,
+    UploadMessage,
+    SharedFile,
+    SessionContext,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +194,8 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
             "description": msg.description,
             "size": msg.size,
         }
+    if isinstance(msg, SessionContext):
+        return "session_context", {"text": msg.text}
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -211,4 +232,6 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             description=content.get("description", ""),
             size=content.get("size", 0),
         )
+    if role == "session_context":
+        return SessionContext(text=content["text"])
     raise ValueError(f"unknown role: {role}")

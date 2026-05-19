@@ -160,10 +160,39 @@ def create_app(config: Config) -> FastAPI:
         return runtime.list_sessions(conn, name, kind=kind, limit=limit)
 
     @app.post("/agents/{name}/sessions")
-    def create_session(name: str):
+    async def create_session(name: str, request: Request):
         if name not in config.agents:
             raise HTTPException(404, "unknown agent")
-        return {"id": runtime.create_session(conn, name, "conversational")}
+        # Body is optional. Accept either an empty request or a JSON object
+        # with `{"context": "..."}` to seed the session's first SessionContext
+        # message.
+        ctx_text = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                ctx_text = (body.get("context") or "").strip()
+        except Exception:
+            pass  # no/invalid body → just create the session
+        sid = runtime.create_session(conn, name, "conversational")
+        if ctx_text:
+            runtime.append_context(conn, sid, ctx_text)
+        return {"id": sid}
+
+    @app.post("/agents/{name}/sessions/{sid}/context")
+    async def append_session_context(name: str, sid: str, request: Request):
+        if not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "expected JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be an object")
+        text = (body.get("context") or "").strip()
+        if not text:
+            raise HTTPException(400, "missing or empty 'context'")
+        count = runtime.append_context(conn, sid, text)
+        return {"ok": True, "count": count}
 
     @app.delete("/agents/{name}/sessions/{sid}")
     def delete_session(name: str, sid: str):

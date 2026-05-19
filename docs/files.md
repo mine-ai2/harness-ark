@@ -4,6 +4,9 @@ Two flows: clients can upload files into an agent's workspace, and agents can
 hand files back to clients. Bytes move over REST; coordination rides the
 existing WebSocket and message history.
 
+For session creation, history, per-session context, and the WebSocket
+protocol overview, see [sessions.md](sessions.md).
+
 ## Where files live
 
 Every agent has a workspace directory ([docs/config.md](config.md)). Within

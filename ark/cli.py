@@ -230,6 +230,7 @@ async def _chat(
     history_only: bool = False,
     attachments: list[Path] | None = None,
     download_dir: Path | None = None,
+    context: str | None = None,
 ) -> int:
     base_url, secret = _client_settings()
     headers = _headers(secret)
@@ -237,10 +238,15 @@ async def _chat(
 
     async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=120) as http:
         if session_id is None:
-            r = await http.post(f"/agents/{agent}/sessions")
+            body: dict = {}
+            if context:
+                body["context"] = context
+            r = await http.post(f"/agents/{agent}/sessions", json=body)
             r.raise_for_status()
             session_id = r.json()["id"]
             print(f"[new session: {session_id}]", file=sys.stderr)
+            if context:
+                print("[context: seeded with --context]", file=sys.stderr)
         else:
             r = await http.get(f"/agents/{agent}/sessions/{session_id}/history")
             r.raise_for_status()
@@ -248,6 +254,18 @@ async def _chat(
                 _print_history_entry(m)
             if history_only:
                 return 0
+            # If resuming and --context is passed, append it as a new context
+            # message rather than seeding.
+            if context:
+                cr = await http.post(
+                    f"/agents/{agent}/sessions/{session_id}/context",
+                    json={"context": context},
+                )
+                cr.raise_for_status()
+                print(
+                    f"[context: appended (total {cr.json().get('count')})]",
+                    file=sys.stderr,
+                )
 
         # Pre-upload any --attach files before opening the WS so the agent
         # already sees them via list_uploads().
@@ -312,6 +330,24 @@ async def _chat(
                         except Exception as e:  # noqa: BLE001
                             print(f"[upload failed: {e}]", file=sys.stderr)
                         continue
+                    if text.startswith("/context "):
+                        ctx_text = text[len("/context "):].strip()
+                        if not ctx_text:
+                            print("[/context: empty, ignored]", file=sys.stderr)
+                            continue
+                        try:
+                            cr = await http.post(
+                                f"/agents/{agent}/sessions/{session_id}/context",
+                                json={"context": ctx_text},
+                            )
+                            cr.raise_for_status()
+                            print(
+                                f"[context appended (total {cr.json().get('count')})]",
+                                file=sys.stderr,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[/context failed: {e}]", file=sys.stderr)
+                        continue
                     turn_done.clear()
                     ui.status("thinking")
                     await ws.send(json.dumps({"type": "user_message", "text": text}))
@@ -359,8 +395,17 @@ def _print_history_entry(m: dict) -> None:
 def cmd_chat(args: argparse.Namespace) -> int:
     attachments = [Path(p).expanduser() for p in (args.attach or [])]
     dl_dir = Path(args.download_dir).expanduser() if args.download_dir else None
+    context = args.context
+    if args.context_file:
+        context = args.context_file.read()
     return asyncio.run(
-        _chat(args.agent, args.session, attachments=attachments, download_dir=dl_dir)
+        _chat(
+            args.agent,
+            args.session,
+            attachments=attachments,
+            download_dir=dl_dir,
+            context=context,
+        )
     )
 
 
@@ -502,6 +547,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--download-dir",
         metavar="DIR",
         help=f"where to save files the agent shares (default: ./{DEFAULT_DOWNLOAD_DIR})",
+    )
+    chat.add_argument(
+        "--context",
+        metavar="TEXT",
+        help="additional instructions for the agent in this session (appended to system prompt)",
+    )
+    chat.add_argument(
+        "--context-file",
+        type=argparse.FileType("r"),
+        metavar="PATH",
+        help="read --context from a file instead of inline",
     )
     chat.set_defaults(func=cmd_chat)
 
