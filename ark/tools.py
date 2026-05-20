@@ -486,7 +486,9 @@ def _post_to_session(*, session_id: str, body: str) -> str:
         session_id,
         {
             "type": "injected_message",
-            "from_session_id": ctx.session_id,
+            "session_id": session_id,          # target session (where this lands)
+            "agent_name": ctx.agent.name,
+            "from_session_id": ctx.session_id,  # source session (where this came from)
             "text": body,
         },
     )
@@ -667,6 +669,8 @@ def _share_with_client(*, path: str, description: str = "") -> str:
         ctx.session_id,
         {
             "type": "file_available",
+            "session_id": ctx.session_id,
+            "agent_name": ctx.agent.name,
             "path": rel,
             "description": description,
             "size": size,

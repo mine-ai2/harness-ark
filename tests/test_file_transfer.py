@@ -226,6 +226,10 @@ async def test_tool_share_with_client_persists_and_publishes(ark_home, tmp_path)
         assert evt["type"] == "file_available"
         assert evt["path"] == "chart.png"
         assert evt["description"] == "Q4"
+        # session_id + agent_name must be tagged so the unified /events WS
+        # firehose can route this to clients.
+        assert evt["session_id"] == sid
+        assert evt["agent_name"] == "scribe"
     finally:
         broker.unsubscribe(sid, queue)
 

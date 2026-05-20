@@ -176,5 +176,9 @@ async def test_post_to_session_publishes_to_broker(ark_home, tmp_path):
         assert evt["type"] == "injected_message"
         assert evt["from_session_id"] == source
         assert evt["text"] == "ping"
+        # session_id + agent_name must be tagged so the unified /events WS
+        # firehose can route this to clients.
+        assert evt["session_id"] == target
+        assert evt["agent_name"] == "scribe"
     finally:
         broker.unsubscribe(target, queue)
