@@ -325,7 +325,10 @@ async def _chat(
                 return 1
 
         ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
-        url = f"{ws_url}/agents/{agent}/sessions/{session_id}?token={secret}"
+        # Unified per-client endpoint: one WS, all events for all sessions.
+        # We filter for the current session in the renderer; cross-session
+        # activity (cron, other agents) flows past quietly.
+        url = f"{ws_url}/events?token={secret}"
         async with websockets.connect(url) as ws:
             print(f"[connected — type your message, Ctrl-D to exit]", file=sys.stderr)
             ui = _Ui()
@@ -337,6 +340,11 @@ async def _chat(
                 try:
                     async for raw in ws:
                         evt = json.loads(raw)
+                        # Drop events that aren't for this session — this is a
+                        # firehose now, so other sessions' activity comes too.
+                        evt_sid = evt.get("session_id")
+                        if evt_sid is not None and evt_sid != session_id:
+                            continue
                         if evt.get("type") == "file_available":
                             await _on_file_available(http, agent, evt, dl_dir, ui)
                             continue
@@ -394,7 +402,15 @@ async def _chat(
                         continue
                     turn_done.clear()
                     ui.status("thinking")
-                    await ws.send(json.dumps({"type": "user_message", "text": text}))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "user_message",
+                                "session_id": session_id,
+                                "text": text,
+                            }
+                        )
+                    )
 
             await asyncio.gather(reader(), writer())
     return 0
@@ -499,7 +515,18 @@ def cmd_cron_list(args: argparse.Namespace) -> int:
         return 0
     for c in rows:
         status = "" if c["enabled"] else " [disabled]"
-        print(f"{c['id']}: {c['expr']}{status} — {c['prompt'][:60]}")
+        prompt = c["prompt"]
+        if args.full:
+            # Indent multi-line prompts under their header.
+            indented = "\n".join("    " + line for line in prompt.splitlines())
+            print(f"{c['id']}: {c['expr']}{status}")
+            print(indented)
+        else:
+            # One-line preview. Collapse newlines so we don't break the table.
+            preview = " ".join(prompt.split())
+            if len(preview) > 100:
+                preview = preview[:100] + "…"
+            print(f"{c['id']}: {c['expr']}{status} — {preview}")
     return 0
 
 
@@ -618,6 +645,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     cron_list = cron_sub.add_parser("list", help="list crons for an agent")
     cron_list.add_argument("agent")
+    cron_list.add_argument(
+        "--full",
+        "-l",
+        action="store_true",
+        help="print full multi-line prompts (default: a 100-char single-line preview)",
+    )
     cron_list.set_defaults(func=cmd_cron_list)
 
     cron_set = cron_sub.add_parser("set", help="add or update a cron entry")

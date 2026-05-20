@@ -526,6 +526,101 @@ _register(
 
 
 # ---------------------------------------------------------------------------
+# Self-introspection: current time + current session info
+# ---------------------------------------------------------------------------
+
+
+def _get_current_time() -> dict:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "iso": now.isoformat(),
+        "unix_ms": int(now.timestamp() * 1000),
+        "weekday": now.strftime("%A"),
+        "tz": "UTC",
+    }
+
+
+def _get_current_session_info() -> dict:
+    import json as _json
+
+    from . import models
+
+    ctx = current_context()
+    row = ctx.conn.execute(
+        "SELECT kind, created_at FROM sessions WHERE id = ?",
+        (ctx.session_id,),
+    ).fetchone()
+    if row is None:
+        raise ToolError(f"session {ctx.session_id} not found")
+    message_count = ctx.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+        (ctx.session_id,),
+    ).fetchone()[0]
+    # Latest TurnMetrics row is the best proxy for "current context fill" —
+    # input_tokens is what the model saw on the most recent call.
+    last_metrics = ctx.conn.execute(
+        "SELECT content_json FROM messages "
+        "WHERE session_id = ? AND role = 'turn_metrics' "
+        "ORDER BY id DESC LIMIT 1",
+        (ctx.session_id,),
+    ).fetchone()
+    last_input_tokens = None
+    last_output_tokens = None
+    if last_metrics is not None:
+        m = _json.loads(last_metrics["content_json"])
+        last_input_tokens = m.get("input_tokens")
+        last_output_tokens = m.get("output_tokens")
+    context_window = models.context_window_for(
+        ctx.agent.model, ctx.agent.max_context_tokens
+    )
+    return {
+        "session_id": ctx.session_id,
+        "agent_name": ctx.agent.name,
+        "model": ctx.agent.model,
+        "kind": row["kind"],
+        "created_at": row["created_at"],
+        "message_count": message_count,
+        "last_input_tokens": last_input_tokens,
+        "last_output_tokens": last_output_tokens,
+        "context_window": context_window,
+    }
+
+
+_register(
+    ToolSchema(
+        name="get_current_time",
+        description=(
+            "Return the current wall-clock time. Use this whenever you need to "
+            "know the actual date or time — your training data has a cutoff and "
+            "may not reflect today. Returns an object with `iso` (ISO 8601 UTC), "
+            "`unix_ms`, `weekday`, and `tz` fields."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    _get_current_time,
+)
+
+_register(
+    ToolSchema(
+        name="get_current_session_info",
+        description=(
+            "Return metadata about the current session: session_id, agent name, "
+            "model, session kind (`conversational`/`heartbeat`/`cron`), creation "
+            "time, message count, and the most recent input/output token counts "
+            "alongside the model's context_window. Useful for self-monitoring "
+            "(e.g. checking how full your context is so you can wrap up before "
+            "hitting the limit) and for cross-session operations (e.g. passing "
+            "your own session_id to another tool)."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    _get_current_session_info,
+)
+
+
+# ---------------------------------------------------------------------------
 # File transfer to/from the client
 # ---------------------------------------------------------------------------
 

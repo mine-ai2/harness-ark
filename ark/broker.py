@@ -1,9 +1,16 @@
-"""In-process pub/sub for live cross-session messages.
+"""In-process pub/sub for live event delivery.
 
-A websocket handler subscribes when a client connects to a session; tools (or
-the runtime) publish events keyed by session id. If no subscriber is present,
-events are dropped — the persisted history is the source of truth, this
-channel only delivers live notifications.
+Two subscription flavors:
+
+- `subscribe(session_id)` — receive events targeted at one session. Used
+  historically by the per-session WebSocket handler; still useful for any
+  code path that wants to listen narrowly.
+- `subscribe_all()` — receive every event regardless of session. Used by the
+  unified per-client `/events` WebSocket.
+
+A publish fans out to BOTH per-session subscribers and global subscribers.
+Events that nobody is subscribed to are dropped — persistence is the DB's
+job, this channel only carries live notifications.
 """
 
 from __future__ import annotations
@@ -12,11 +19,18 @@ import asyncio
 
 
 _subscribers: dict[str, list[asyncio.Queue]] = {}
+_global_subscribers: list[asyncio.Queue] = []
 
 
 def subscribe(session_id: str) -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue()
     _subscribers.setdefault(session_id, []).append(q)
+    return q
+
+
+def subscribe_all() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue()
+    _global_subscribers.append(q)
     return q
 
 
@@ -31,8 +45,20 @@ def unsubscribe(session_id: str, q: asyncio.Queue) -> None:
         del _subscribers[session_id]
 
 
+def unsubscribe_all(q: asyncio.Queue) -> None:
+    try:
+        _global_subscribers.remove(q)
+    except ValueError:
+        return
+
+
 def publish(session_id: str, event: dict) -> None:
     for q in _subscribers.get(session_id, []):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+    for q in _global_subscribers:
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
@@ -40,4 +66,4 @@ def publish(session_id: str, event: dict) -> None:
 
 
 def has_subscribers(session_id: str) -> bool:
-    return bool(_subscribers.get(session_id))
+    return bool(_subscribers.get(session_id)) or bool(_global_subscribers)

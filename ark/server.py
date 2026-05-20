@@ -15,17 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import broker, db, runtime, skills, workspace as ws
 from .config import Config
 from .scheduler import Scheduler
-from .types import (
-    AssistantTurnEnd,
-    RunEnd,
-    RunErrorEvent,
-    TextDelta,
-    ThinkingDelta,
-    ToolCallEvent,
-    ToolResultEvent,
-    TurnUsageEvent,
-    UploadMessage,
-)
+from .types import AssistantText, UploadMessage, message_from_row
 
 UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # 25 MB v1 cap
 
@@ -283,59 +273,170 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(404, "not found")
         return FileResponse(full, filename=full.name)
 
-    @app.websocket("/agents/{name}/sessions/{sid}")
-    async def ws_session(ws: WebSocket, name: str, sid: str):
+    # ------------------------------------------------------------------
+    # Unified per-client event stream + cross-session catch-up
+    # ------------------------------------------------------------------
+
+    @app.get("/events")
+    def list_events(
+        since_id: int | None = None,
+        since_ms: int | None = None,
+        limit: int = 200,
+    ):
+        """Catch-up query: persisted messages across every session, ordered by
+        the monotonic message id. Use `since_id` for durable resume (the id
+        the client last processed), or `since_ms` for a wall-clock-relative
+        window. If neither is given, returns the most recent `limit` events."""
+
+        limit = max(1, min(int(limit), 1000))
+        sql = (
+            "SELECT m.id, m.session_id, m.created_at, m.role, m.content_json, "
+            "s.agent_name FROM messages m JOIN sessions s ON s.id = m.session_id"
+        )
+        where: list[str] = []
+        params: list = []
+        if since_id is not None:
+            where.append("m.id > ?")
+            params.append(int(since_id))
+        if since_ms is not None:
+            where.append("m.created_at >= ?")
+            params.append(int(since_ms))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        if since_id is None and since_ms is None:
+            # No cursor → return the *latest* `limit` rows. Order DESC, then
+            # reverse client-side to keep ascending wire shape.
+            sql += " ORDER BY m.id DESC LIMIT ?"
+            params.append(limit + 1)
+            rows = list(conn.execute(sql, params).fetchall())
+            has_more = len(rows) > limit
+            rows = list(reversed(rows[:limit]))
+        else:
+            sql += " ORDER BY m.id ASC LIMIT ?"
+            params.append(limit + 1)
+            rows = list(conn.execute(sql, params).fetchall())
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+
+        events: list[dict] = []
+        for r in rows:
+            msg = message_from_row(r["role"], json.loads(r["content_json"]))
+            wire = _message_to_json(msg)
+            events.append(
+                {
+                    "id": r["id"],
+                    "session_id": r["session_id"],
+                    "agent_name": r["agent_name"],
+                    "created_at": r["created_at"],
+                    **wire,
+                }
+            )
+        return {
+            "events": events,
+            "next_since_id": events[-1]["id"] if events else since_id,
+            "has_more": has_more,
+        }
+
+    @app.websocket("/events")
+    async def ws_events(ws: WebSocket):
+        """Single per-client WebSocket. Receives events for every session of
+        every agent. Commands target a session via the `session_id` field."""
+
         token = ws.headers.get("authorization", "") or _qs_token(ws)
         if not _check_bearer(token, config.server.auth_secret):
             await ws.close(code=1008)
             return
-        agent = config.agents.get(name)
-        if agent is None or not runtime.session_exists(conn, sid, name):
-            await ws.close(code=1003)
-            return
         await ws.accept()
-        queue = broker.subscribe(sid)
-        injected_task = asyncio.create_task(_forward_injected(ws, queue))
+        queue = broker.subscribe_all()
+
+        async def forwarder() -> None:
+            try:
+                while True:
+                    event = await queue.get()
+                    try:
+                        await ws.send_json(event)
+                    except Exception:  # noqa: BLE001
+                        return
+            except asyncio.CancelledError:
+                return
+
+        fwd_task = asyncio.create_task(forwarder())
         try:
             while True:
                 raw = await ws.receive_text()
-                msg = json.loads(raw)
-                t = msg.get("type")
-                if t == "stop":
-                    continue  # mid-turn cancellation: v1 no-op
-                if t != "user_message":
-                    await ws.send_json({"type": "error", "message": "unsupported message type"})
-                    continue
                 try:
-                    async for evt in runtime.run_user_turn(
+                    cmd = json.loads(raw)
+                except json.JSONDecodeError:
+                    await ws.send_json(
+                        {"type": "error", "code": "other", "message": "invalid JSON"}
+                    )
+                    continue
+                t = cmd.get("type")
+                sid = cmd.get("session_id")
+                if t == "stop":
+                    # v1: no-op (mid-turn cancellation isn't supported).
+                    continue
+                if t != "user_message":
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "code": "other",
+                            "message": f"unsupported command type: {t!r}",
+                        }
+                    )
+                    continue
+                if not sid or not isinstance(sid, str):
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "code": "other",
+                            "message": "user_message requires a string `session_id`",
+                        }
+                    )
+                    continue
+                row = conn.execute(
+                    "SELECT agent_name FROM sessions WHERE id = ?", (sid,)
+                ).fetchone()
+                if row is None:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "session_id": sid,
+                            "code": "other",
+                            "message": "unknown session",
+                        }
+                    )
+                    continue
+                agent = config.agents.get(row["agent_name"])
+                if agent is None:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "session_id": sid,
+                            "code": "other",
+                            "message": f"unknown agent {row['agent_name']!r}",
+                        }
+                    )
+                    continue
+                # Spawn the turn as a background task — multiple sessions can
+                # have turns running concurrently. Their events all flow back
+                # through this same WS via the broker subscription.
+                asyncio.create_task(
+                    runtime.run_and_publish(
                         conn=conn,
                         config=config,
                         agent=agent,
                         session_id=sid,
-                        user_text=msg.get("text", ""),
-                    ):
-                        await ws.send_json(_event_to_wire(evt))
-                except Exception as e:  # noqa: BLE001
-                    await ws.send_json({"type": "error", "message": f"{type(e).__name__}: {e}"})
+                        user_text=cmd.get("text", ""),
+                    )
+                )
         except WebSocketDisconnect:
             return
         finally:
-            injected_task.cancel()
-            broker.unsubscribe(sid, queue)
+            fwd_task.cancel()
+            broker.unsubscribe_all(queue)
 
     return app
-
-
-async def _forward_injected(ws: WebSocket, queue: asyncio.Queue) -> None:
-    try:
-        while True:
-            event = await queue.get()
-            try:
-                await ws.send_json(event)
-            except Exception:  # noqa: BLE001
-                return
-    except asyncio.CancelledError:
-        return
 
 
 def _check_bearer(header: str, expected: str) -> bool:
@@ -349,38 +450,22 @@ def _qs_token(ws: WebSocket) -> str:
     return f"Bearer {token}" if token else ""
 
 
-def _event_to_wire(evt: Any) -> dict:
-    if isinstance(evt, TextDelta):
-        return {"type": "assistant_delta", "text": evt.text}
-    if isinstance(evt, ThinkingDelta):
-        return {"type": "thinking", "delta": evt.text}
-    if isinstance(evt, AssistantTurnEnd):
-        return {"type": "assistant_message", "text": evt.text}
-    if isinstance(evt, ToolCallEvent):
-        return {"type": "tool_call", "id": evt.id, "name": evt.name, "input": evt.input}
-    if isinstance(evt, ToolResultEvent):
-        return {
-            "type": "tool_result",
-            "id": evt.call_id,
-            "output": evt.output,
-            "error": evt.is_error,
-        }
-    if isinstance(evt, TurnUsageEvent):
-        return {
-            "type": "turn_usage",
-            "input_tokens": evt.input_tokens,
-            "output_tokens": evt.output_tokens,
-            "model": evt.model,
-            "context_window": evt.context_window,
-        }
-    if isinstance(evt, RunErrorEvent):
-        return {"type": "error", "code": evt.code, "message": evt.message}
-    if isinstance(evt, RunEnd):
-        return {"type": "done", "stop_reason": evt.stop_reason}
-    if is_dataclass(evt):
-        return {"type": type(evt).__name__, **asdict(evt)}
-    return {"type": "unknown"}
-
-
 def _message_to_json(msg: Any) -> dict:
-    return {"kind": type(msg).__name__, "data": asdict(msg) if is_dataclass(msg) else {}}
+    if not is_dataclass(msg):
+        return {"kind": type(msg).__name__, "data": {}}
+    # An AssistantText with `injected_from` set represents a cross-session
+    # injection (see post_to_session). Surface it under a distinct kind so
+    # clients can render it consistently with the live `injected_message`
+    # WS event, rather than seeing two different shapes for the same thing.
+    if isinstance(msg, AssistantText) and msg.injected_from:
+        return {
+            "kind": "InjectedMessage",
+            "data": {"text": msg.text, "from_session_id": msg.injected_from},
+        }
+    data = asdict(msg)
+    # `thought_signature` is opaque bytes used internally to round-trip Gemini
+    # thinking traces back to the model. Not meaningful to clients, and
+    # FastAPI's default JSON encoder treats bytes as UTF-8 strings, which
+    # explodes for binary content. Drop it before serializing.
+    data.pop("thought_signature", None)
+    return {"kind": type(msg).__name__, "data": data}

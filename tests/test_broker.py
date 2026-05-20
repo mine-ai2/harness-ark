@@ -33,3 +33,39 @@ async def test_multiple_subscribers_each_get_event():
     assert e2 == {"ok": True}
     broker.unsubscribe("dual", q1)
     broker.unsubscribe("dual", q2)
+
+
+@pytest.mark.asyncio
+async def test_subscribe_all_sees_every_session():
+    """subscribe_all() receives every publish regardless of session_id."""
+    gq = broker.subscribe_all()
+    try:
+        broker.publish("a", {"n": 1})
+        broker.publish("b", {"n": 2})
+        broker.publish("c", {"n": 3})
+        events = [await asyncio.wait_for(gq.get(), timeout=0.5) for _ in range(3)]
+        assert events == [{"n": 1}, {"n": 2}, {"n": 3}]
+    finally:
+        broker.unsubscribe_all(gq)
+
+
+@pytest.mark.asyncio
+async def test_publish_reaches_both_per_session_and_global():
+    sq = broker.subscribe("x")
+    gq = broker.subscribe_all()
+    try:
+        broker.publish("x", {"both": True})
+        assert (await asyncio.wait_for(sq.get(), timeout=0.5)) == {"both": True}
+        assert (await asyncio.wait_for(gq.get(), timeout=0.5)) == {"both": True}
+    finally:
+        broker.unsubscribe("x", sq)
+        broker.unsubscribe_all(gq)
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_all_stops_delivery():
+    gq = broker.subscribe_all()
+    broker.unsubscribe_all(gq)
+    broker.publish("nobody-cares", {"x": 1})
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gq.get(), timeout=0.1)

@@ -30,14 +30,17 @@ class Scheduler:
         self.last_heartbeat: dict[str, float] = {}
         self.last_cron: dict[tuple[str, str], float] = {}
         self._task: asyncio.Task | None = None
-        self._stop = asyncio.Event()
+        # asyncio.Event() needs a running loop on Python 3.9 — defer until start().
+        self._stop: asyncio.Event | None = None
 
     def start(self) -> None:
         if self._task is None:
+            self._stop = asyncio.Event()
             self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
-        self._stop.set()
+        if self._stop is not None:
+            self._stop.set()
         if self._task is not None:
             self._task.cancel()
             try:
@@ -65,14 +68,19 @@ class Scheduler:
             except asyncio.TimeoutError:
                 continue
 
-    async def _tick(self) -> None:
-        now = time.time()
+    async def _tick(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.time()
         # heartbeats
         for name, agent in self.config.agents.items():
             interval = self._heartbeat_interval(name)
             if not interval:
                 continue
-            if now - self.last_heartbeat.get(name, now) >= interval:
+            # `.setdefault` (not `.get`) so newly-configured agents anchor
+            # their "last fired" at first observation rather than being reset
+            # to now on every tick.
+            last = self.last_heartbeat.setdefault(name, now)
+            if now - last >= interval:
                 self.last_heartbeat[name] = now
                 asyncio.create_task(self._fire_heartbeat(name))
 
@@ -80,10 +88,13 @@ class Scheduler:
         rows = self.conn.execute(
             "SELECT agent_name, id, expr, prompt FROM crons WHERE enabled = 1"
         ).fetchall()
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
         for row in rows:
             key = (row["agent_name"], row["id"])
-            last = self.last_cron.get(key, now)
+            # Same `.setdefault` pattern — without this, crons added after
+            # startup would never fire because last_cron[key] would never get
+            # written.
+            last = self.last_cron.setdefault(key, now)
             last_dt = datetime.fromtimestamp(last, tz=timezone.utc)
             try:
                 next_dt = croniter(row["expr"], last_dt).get_next(datetime)
@@ -126,13 +137,15 @@ class Scheduler:
             return
         sid = runtime.create_session(self.conn, agent_name, kind=kind)
         try:
-            async for _ in runtime.run_user_turn(
+            # run_and_publish routes events through the broker so connected
+            # clients on the unified /events WS see scheduled-session activity
+            # just like they see user-driven turns.
+            await runtime.run_and_publish(
                 conn=self.conn,
                 config=self.config,
                 agent=agent,
                 session_id=sid,
                 user_text=prompt,
-            ):
-                pass
+            )
         except Exception as e:  # noqa: BLE001
             print(f"[scheduler] {kind} session {sid} error: {e}", file=sys.stderr)

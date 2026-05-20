@@ -135,36 +135,97 @@ ark chat <agent> --session SID --context "..." # append to a resumed session
 you> /context <additional instructions>
 ```
 
-## WebSocket session interaction
+## The event stream (unified per-client)
+
+Ark exposes a **single WebSocket per client** that carries events for every
+session the bearer token has access to. The same connection delivers
+streaming text from the active chat, cron-injected messages from other
+sessions, tool calls happening in background runs, and so on — clients
+multiplex on `session_id` to decide what to render where.
 
 ```
-WS /agents/{name}/sessions/{sid}
+WS /events
 Authorization: Bearer <auth_secret>           # header, or ?token=... in URL
 ```
 
-The WS protocol is described in [design/design.md §12.2](../design/design.md).
-Quick summary of the event shapes the client sees:
+Every event the server pushes has `session_id` and (where applicable)
+`agent_name`. Commands the client sends carry `session_id` to route to the
+right session.
 
-| Server → client | When |
-|---|---|
-| `{ "type": "assistant_delta", "text": ... }` | Streaming assistant text |
-| `{ "type": "assistant_message", "text": ... }` | End of one provider turn |
-| `{ "type": "thinking", "delta": ... }` | Extended-thinking text (Gemini/Anthropic) |
-| `{ "type": "tool_call", "id", "name", "input" }` | Model invoked a tool |
-| `{ "type": "tool_result", "id", "output", "error" }` | Tool returned |
-| `{ "type": "turn_usage", "input_tokens", "output_tokens", "model", "context_window" }` | Per-turn token counts. `context_window` is the model's input ceiling (null if unknown). See [Usage tracking](#usage-tracking) below. |
-| `{ "type": "file_available", "path", "description", "size" }` | Agent shared a file (see [files.md](files.md)) |
-| `{ "type": "injected_message", "from_session_id", "text" }` | Another session injected a message |
-| `{ "type": "error", "code", "message" }` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
-| `{ "type": "done", "stop_reason" }` | Whole run-loop finished, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
+### Server → client events
 
-| Client → server | Effect |
-|---|---|
-| `{ "type": "user_message", "text": ... }` | Start a new turn |
-| `{ "type": "stop" }` | Request cancellation (v1: no-op — see design.md §6) |
+| Event | Fields | When |
+|---|---|---|
+| `assistant_delta` | `text` | Streaming assistant text |
+| `assistant_message` | `text` | End of one provider turn |
+| `thinking` | `delta` | Extended-thinking text (Gemini/Anthropic) |
+| `tool_call` | `id`, `name`, `input` | Model invoked a tool |
+| `tool_result` | `id`, `output`, `error` | Tool returned |
+| `turn_usage` | `input_tokens`, `output_tokens`, `model`, `context_window` | Per-turn token counts (`context_window` is null if unknown). See [Usage tracking](#usage-tracking) below. |
+| `file_available` | `path`, `description`, `size` | Agent shared a file (see [files.md](files.md)) |
+| `injected_message` | `from_session_id`, `text` | Another session injected a message via `post_to_session` |
+| `error` | `code`, `message` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
+| `done` | `stop_reason` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
+
+Every event also carries `session_id` and (except for the broad "error" case
+where the session couldn't be identified) `agent_name`.
+
+### Client → server commands
+
+| Command | Required fields | Effect |
+|---|---|---|
+| `user_message` | `session_id`, `text` | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. |
+| `stop` | `session_id` | Request cancellation (v1: no-op — see design.md §6). |
 
 Per-session context is **not** added over the WS — it's a REST operation
 even mid-chat. The CLI does the REST call when you type `/context ...`.
+
+### Cross-session catch-up
+
+```
+GET /events?since_id=<int>&since_ms=<int>&limit=<int>
+```
+
+Returns persisted messages across *every* session, ordered by the monotonic
+message id. Use this to fill the gap between disconnect and reconnect, to
+compute unread counts, or to populate "what's new since I last opened the
+app" UIs.
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "id": 12345,
+      "session_id": "...",
+      "agent_name": "scribe",
+      "created_at": 1747852800000,
+      "kind": "AssistantText",
+      "data": { "text": "..." }
+    },
+    {
+      "id": 12346,
+      "session_id": "different-session",
+      "agent_name": "vanto",
+      "created_at": 1747852805000,
+      "kind": "InjectedMessage",
+      "data": { "text": "...", "from_session_id": "..." }
+    }
+  ],
+  "next_since_id": 12346,
+  "has_more": false
+}
+```
+
+- `since_id` is the durable cursor — pass back what came as `next_since_id`
+  on your previous call to resume cleanly.
+- `since_ms` is a wall-clock-relative window (Unix milliseconds). Best-effort
+  — wall-clock ties can be ambiguous; prefer `since_id` for "exact resume."
+- Default (no cursor) returns the most recent `limit` events, ascending.
+- `limit` defaults to 200, max 1000.
+- Same `kind` translation as `/history` — including `InjectedMessage`
+  surfacing for cross-session injections.
 
 ## Usage tracking
 

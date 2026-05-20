@@ -51,6 +51,13 @@ MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        2,
+        # Index for the `/events?since_ms=...` catch-up query (cross-session
+        # scan ordered by wall-clock time). The id-based catch-up uses the
+        # primary key, so it doesn't need a separate index.
+        "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);",
+    ),
 ]
 
 

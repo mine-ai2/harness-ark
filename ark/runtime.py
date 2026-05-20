@@ -8,7 +8,9 @@ import time
 import uuid
 from typing import AsyncIterator
 
-from . import models, paths, tools
+from dataclasses import asdict, is_dataclass
+
+from . import broker, models, paths, tools
 from .config import AgentConfig, Config
 from .provider import AnthropicProvider, Provider
 from .types import (
@@ -366,3 +368,90 @@ async def run_user_turn(
             yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)
 
     yield RunEnd(stop_reason="max_iterations")
+
+
+# ---------------------------------------------------------------------------
+# Wire-format conversion + broker publishing
+# ---------------------------------------------------------------------------
+
+
+def event_to_wire(evt: RuntimeEvent | Message) -> dict:
+    """Convert a RuntimeEvent (or persisted Message) to its wire-format dict.
+
+    Lives in runtime.py rather than server.py so both the WebSocket handler
+    and the scheduler can use it without circular imports.
+    """
+
+    if isinstance(evt, TextDelta):
+        return {"type": "assistant_delta", "text": evt.text}
+    if isinstance(evt, ThinkingDelta):
+        return {"type": "thinking", "delta": evt.text}
+    if isinstance(evt, AssistantTurnEnd):
+        return {"type": "assistant_message", "text": evt.text}
+    if isinstance(evt, ToolCallEvent):
+        return {"type": "tool_call", "id": evt.id, "name": evt.name, "input": evt.input}
+    if isinstance(evt, ToolResultEvent):
+        return {
+            "type": "tool_result",
+            "id": evt.call_id,
+            "output": evt.output,
+            "error": evt.is_error,
+        }
+    if isinstance(evt, TurnUsageEvent):
+        return {
+            "type": "turn_usage",
+            "input_tokens": evt.input_tokens,
+            "output_tokens": evt.output_tokens,
+            "model": evt.model,
+            "context_window": evt.context_window,
+        }
+    if isinstance(evt, RunErrorEvent):
+        return {"type": "error", "code": evt.code, "message": evt.message}
+    if isinstance(evt, RunEnd):
+        return {"type": "done", "stop_reason": evt.stop_reason}
+    if is_dataclass(evt):
+        return {"type": type(evt).__name__, **asdict(evt)}
+    return {"type": "unknown"}
+
+
+async def run_and_publish(
+    *,
+    conn: sqlite3.Connection,
+    config: Config,
+    agent: AgentConfig,
+    session_id: str,
+    user_text: str,
+) -> None:
+    """Drive a user turn and publish each event to the broker.
+
+    Every event is tagged with `session_id` and `agent_name` so subscribers
+    (per-session or global) can route. Use this from any code path that wants
+    a turn's events visible to connected clients — the unified WS handler,
+    the scheduler, etc.
+    """
+
+    try:
+        async for evt in run_user_turn(
+            conn=conn,
+            config=config,
+            agent=agent,
+            session_id=session_id,
+            user_text=user_text,
+        ):
+            wire = event_to_wire(evt)
+            wire["session_id"] = session_id
+            wire["agent_name"] = agent.name
+            broker.publish(session_id, wire)
+    except Exception as e:  # noqa: BLE001
+        # run_user_turn catches provider exceptions itself; this is for anything
+        # that escapes (programming errors, broker failures, etc.).
+        broker.publish(
+            session_id,
+            {
+                "type": "error",
+                "session_id": session_id,
+                "agent_name": agent.name,
+                "code": "other",
+                "message": f"{type(e).__name__}: {e}",
+            },
+        )

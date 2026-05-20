@@ -10,13 +10,14 @@ def test_migrate_creates_schema(ark_home):
         ).fetchall()
     }
     assert {"sessions", "messages", "agent_state", "crons"} <= tables
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    # Schema version tracks the highest applied migration in db.MIGRATIONS.
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.MIGRATIONS[-1][0]
 
 
 def test_migrate_is_idempotent(ark_home):
     db.init_db().close()
     conn = db.init_db()
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.MIGRATIONS[-1][0]
 
 
 def test_tool_call_thought_signature_roundtrips(ark_home):
