@@ -10,13 +10,14 @@ from typing import AsyncIterator
 
 from dataclasses import asdict, is_dataclass
 
-from . import broker, models, paths, tools
+from . import broker, models, paths, projects, tools
 from .config import AgentConfig, Config
 from .provider import AnthropicProvider, Provider
 from .types import (
     AssistantText,
     AssistantTurnEnd,
     Message,
+    Project,
     RunEnd,
     RunError,
     RunErrorEvent,
@@ -84,13 +85,33 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def create_session(conn: sqlite3.Connection, agent_name: str, kind: str = "conversational") -> str:
+def create_session(
+    conn: sqlite3.Connection,
+    agent_name: str,
+    kind: str = "conversational",
+    project_id: str | None = None,
+) -> str:
     sid = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO sessions(id, agent_name, kind, created_at) VALUES (?,?,?,?)",
-        (sid, agent_name, kind, now_ms()),
+        "INSERT INTO sessions(id, agent_name, kind, created_at, project_id) VALUES (?,?,?,?,?)",
+        (sid, agent_name, kind, now_ms(), project_id),
     )
     return sid
+
+
+def session_project(conn: sqlite3.Connection, session_id: str) -> Project | None:
+    """Return the Project bound to a session, or None if the session is
+    project-less (or the project has been deleted)."""
+
+    row = conn.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None or row["project_id"] is None:
+        return None
+    p = projects.get(conn, row["project_id"])
+    if p is None or p.deleted_at is not None:
+        return None
+    return p
 
 
 def list_sessions(
@@ -150,7 +171,9 @@ def append_message(conn: sqlite3.Connection, session_id: str, msg: Message) -> N
 
 
 def system_prompt(
-    agent: AgentConfig, contexts: list[SessionContext] | None = None
+    agent: AgentConfig,
+    contexts: list[SessionContext] | None = None,
+    project: Project | None = None,
 ) -> str:
     """Build the system prompt.
 
@@ -158,7 +181,8 @@ def system_prompt(
       1. The user's `session_context.md` — agent identity / persona
       2. The Environment stanza — runtime facts (workspace path, available
          file/shell/upload helpers)
-      3. Any client-supplied SessionContext messages, concatenated in order
+      3. Project framing — only when this session is bound to a project
+      4. Any client-supplied SessionContext messages, concatenated in order
     """
 
     ctx_path = paths.agent_dir(agent.name) / "session_context.md"
@@ -176,7 +200,8 @@ def system_prompt(
         "operate on real paths on this server. The current working directory for "
         "each tool call is your workspace above. When in doubt about where a file "
         "lives, call list_files first instead of guessing.\n"
-        "- Files the user attaches arrive in `uploads/` (relative to your workspace). "
+        "- Files the user attaches arrive in `uploads/` (relative to your workspace, "
+        "or to the project root if this session is in a project — see below). "
         "Newer uploads of the same name are auto-suffixed (e.g. `report-2.pdf`). "
         "Use `list_uploads` to see what's available, newest first.\n"
         "- To hand a file back to the user, write it anywhere in your workspace "
@@ -184,6 +209,24 @@ def system_prompt(
         "notified and given a download link.\n"
     )
     out = body + env
+    if project is not None:
+        proj = (
+            "\n\n---\n"
+            "Project (this session):\n"
+            f"- Name: {project.name}\n"
+            f"- Root: {project.root}\n"
+        )
+        if project.description:
+            proj += f"- Description: {project.description}\n"
+        if project.project_context.strip():
+            proj += "\n" + project.project_context.strip() + "\n"
+        proj += (
+            "\nAll file operations should target paths under the project root above "
+            "unless explicitly asked to modify your workspace. The project is where "
+            "the user can see and edit your work; your workspace is private scratch "
+            "space. Uploads in this session land in `<project_root>/uploads/`.\n"
+        )
+        out += proj
     if contexts:
         joined = "\n\n".join(c.text for c in contexts if c.text.strip())
         if joined:
@@ -273,6 +316,7 @@ async def run_user_turn(
     context_window = models.context_window_for(
         agent.model, agent.max_context_tokens
     )
+    project = session_project(conn, session_id)
 
     last_stop_reason: str | None = None
     # Message kinds that exist as session-history metadata but must NOT be
@@ -283,7 +327,7 @@ async def run_user_turn(
         history = load_history(conn, session_id)
         contexts = [m for m in history if isinstance(m, SessionContext)]
         turn_messages = [m for m in history if not isinstance(m, _llm_excluded)]
-        system = system_prompt(agent, contexts)
+        system = system_prompt(agent, contexts, project=project)
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
         turn_text = ""

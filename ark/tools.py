@@ -547,11 +547,11 @@ def _get_current_time() -> dict:
 def _get_current_session_info() -> dict:
     import json as _json
 
-    from . import models
+    from . import models, runtime
 
     ctx = current_context()
     row = ctx.conn.execute(
-        "SELECT kind, created_at FROM sessions WHERE id = ?",
+        "SELECT kind, created_at, project_id FROM sessions WHERE id = ?",
         (ctx.session_id,),
     ).fetchone()
     if row is None:
@@ -577,6 +577,7 @@ def _get_current_session_info() -> dict:
     context_window = models.context_window_for(
         ctx.agent.model, ctx.agent.max_context_tokens
     )
+    project = runtime.session_project(ctx.conn, ctx.session_id)
     return {
         "session_id": ctx.session_id,
         "agent_name": ctx.agent.name,
@@ -587,6 +588,29 @@ def _get_current_session_info() -> dict:
         "last_input_tokens": last_input_tokens,
         "last_output_tokens": last_output_tokens,
         "context_window": context_window,
+        # null when the session isn't bound to a project
+        "project_id": project.id if project is not None else None,
+        "project_name": project.name if project is not None else None,
+        "project_root": project.root if project is not None else None,
+    }
+
+
+def _get_project_info() -> dict | None:
+    """Return the project record for the current session, or None if the
+    session isn't in a project."""
+    from . import runtime
+
+    ctx = current_context()
+    project = runtime.session_project(ctx.conn, ctx.session_id)
+    if project is None:
+        return None
+    return {
+        "id": project.id,
+        "name": project.name,
+        "root": project.root,
+        "description": project.description,
+        "project_context": project.project_context,
+        "created_at": project.created_at,
     }
 
 
@@ -610,15 +634,30 @@ _register(
         description=(
             "Return metadata about the current session: session_id, agent name, "
             "model, session kind (`conversational`/`heartbeat`/`cron`), creation "
-            "time, message count, and the most recent input/output token counts "
-            "alongside the model's context_window. Useful for self-monitoring "
-            "(e.g. checking how full your context is so you can wrap up before "
-            "hitting the limit) and for cross-session operations (e.g. passing "
-            "your own session_id to another tool)."
+            "time, message count, the most recent input/output token counts "
+            "alongside the model's context_window, and the project this session "
+            "is bound to (`project_id`/`project_name`/`project_root`, or null "
+            "for non-project sessions). Useful for self-monitoring (context "
+            "fill) and for knowing which project root to operate against."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
     _get_current_session_info,
+)
+
+_register(
+    ToolSchema(
+        name="get_project_info",
+        description=(
+            "Return the project record for the current session, or null if "
+            "this session isn't bound to a project. Includes id, name, root "
+            "path, description, and the project's context (system-prompt "
+            "extension). Use this when you need richer project metadata than "
+            "`get_current_session_info` exposes."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    _get_project_info,
 )
 
 
@@ -628,10 +667,16 @@ _register(
 
 
 def _list_uploads() -> str:
-    from . import workspace as ws
+    from pathlib import Path
+
+    from . import runtime, workspace as ws
 
     ctx = current_context()
-    uploads = ws.uploads_dir(ctx.agent.workspace)
+    # Uploads land in the project root when the session is bound to a project;
+    # otherwise in the agent's workspace. Mirror that here.
+    proj = runtime.session_project(ctx.conn, ctx.session_id)
+    base = Path(proj.root) if proj is not None else ctx.agent.workspace
+    uploads = ws.uploads_dir(base)
     if not uploads.is_dir():
         return "(no uploads)"
     entries = sorted(

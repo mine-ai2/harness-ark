@@ -58,6 +58,28 @@ MIGRATIONS: list[tuple[int, str]] = [
         # primary key, so it doesn't need a separate index.
         "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);",
     ),
+    (
+        3,
+        """
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          root TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          project_context TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          deleted_at INTEGER
+        );
+
+        -- Names must be unique among active (non-deleted) projects, but a
+        -- soft-deleted project's name can be reused for a fresh one.
+        CREATE UNIQUE INDEX idx_projects_name_active
+          ON projects(name) WHERE deleted_at IS NULL;
+
+        ALTER TABLE sessions ADD COLUMN project_id TEXT REFERENCES projects(id);
+        CREATE INDEX idx_sessions_project ON sessions(project_id);
+        """,
+    ),
 ]
 
 

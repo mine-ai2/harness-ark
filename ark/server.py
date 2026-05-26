@@ -7,12 +7,13 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import broker, db, runtime, skills, workspace as ws
+from . import broker, db, file_watcher, projects, runtime, skills, workspace as ws
 from .config import Config
 from .scheduler import Scheduler
 from .types import AssistantText, UploadMessage, message_from_row
@@ -28,9 +29,19 @@ def create_app(config: Config) -> FastAPI:
     async def lifespan(_app: FastAPI):
         sched = Scheduler(conn, config)
         sched.start()
+        watcher = file_watcher.get_watcher()
+        await watcher.start()
+        # Watch every active project that already exists.
+        for p in projects.list_projects(conn):
+            watcher.watch("project", p.id, p.root)
+        # Watch every agent's workspace so REST file edits surface as live events.
+        for agent in config.agents.values():
+            agent.workspace.mkdir(parents=True, exist_ok=True)
+            watcher.watch("workspace", agent.name, str(agent.workspace))
         try:
             yield
         finally:
+            await watcher.stop()
             await sched.stop()
 
     app = FastAPI(title="Ark", lifespan=lifespan)
@@ -155,17 +166,25 @@ def create_app(config: Config) -> FastAPI:
     async def create_session(name: str, request: Request):
         if name not in config.agents:
             raise HTTPException(404, "unknown agent")
-        # Body is optional. Accept either an empty request or a JSON object
-        # with `{"context": "..."}` to seed the session's first SessionContext
-        # message.
+        # Body is optional. Accept an empty request, or `{context?, project_id?}`.
         ctx_text = ""
+        project_id: str | None = None
         try:
             body = await request.json()
             if isinstance(body, dict):
                 ctx_text = (body.get("context") or "").strip()
+                project_id = body.get("project_id") or None
         except Exception:
             pass  # no/invalid body → just create the session
-        sid = runtime.create_session(conn, name, "conversational")
+
+        if project_id is not None:
+            p = projects.get(conn, project_id)
+            if p is None or p.deleted_at is not None:
+                raise HTTPException(400, f"unknown or deleted project: {project_id!r}")
+
+        sid = runtime.create_session(
+            conn, name, "conversational", project_id=project_id
+        )
         if ctx_text:
             runtime.append_context(conn, sid, ctx_text)
         return {"id": sid}
@@ -193,6 +212,157 @@ def create_app(config: Config) -> FastAPI:
         runtime.delete_session(conn, sid)
         return {"ok": True}
 
+    # ------------------------------------------------------------------
+    # Projects: shared user-visible working directories
+    # ------------------------------------------------------------------
+
+    @app.post("/projects")
+    async def create_project(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be an object")
+        try:
+            p = projects.create(
+                conn,
+                name=body.get("name") or "",
+                root=body.get("root"),
+                description=body.get("description") or "",
+                project_context=body.get("project_context") or "",
+            )
+        except projects.ProjectError as e:
+            raise HTTPException(400, str(e))
+        file_watcher.get_watcher().watch("project", p.id, p.root)
+        return _project_to_json(p)
+
+    @app.get("/projects")
+    def list_projects_endpoint(include_deleted: bool = False):
+        return [
+            _project_to_json(p)
+            for p in projects.list_projects(conn, include_deleted=include_deleted)
+        ]
+
+    @app.get("/projects/{pid}")
+    def get_project(pid: str):
+        p = projects.get(conn, pid)
+        if p is None:
+            raise HTTPException(404, "unknown project")
+        return _project_to_json(p)
+
+    @app.put("/projects/{pid}")
+    async def update_project(pid: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "expected JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be an object")
+        try:
+            p = projects.update(
+                conn,
+                pid,
+                name=body.get("name"),
+                description=body.get("description"),
+                project_context=body.get("project_context"),
+            )
+        except projects.ProjectError as e:
+            raise HTTPException(400, str(e))
+        return _project_to_json(p)
+
+    @app.delete("/projects/{pid}")
+    def delete_project(pid: str):
+        # Soft-delete only — files on disk are untouched.
+        if not projects.soft_delete(conn, pid):
+            raise HTTPException(404, "unknown or already-deleted project")
+        file_watcher.get_watcher().unwatch("project", pid)
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Project filesystem endpoints
+    # ------------------------------------------------------------------
+
+    def _project_or_404(pid: str):
+        p = projects.get(conn, pid)
+        if p is None or p.deleted_at is not None:
+            raise HTTPException(404, "unknown or deleted project")
+        return p
+
+    def _resolve_or_400(p, relative: str) -> Path:
+        try:
+            return projects.resolve_path(p, relative)
+        except projects.ProjectPathError as e:
+            raise HTTPException(400, str(e))
+
+    def _dir_listing(target: Path, project_relative: str) -> dict:
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
+            st = child.stat()
+            entries.append(
+                {
+                    "name": child.name,
+                    "is_dir": child.is_dir(),
+                    "size": st.st_size if child.is_file() else 0,
+                    "mtime": int(st.st_mtime * 1000),
+                }
+            )
+        return {"path": project_relative, "entries": entries}
+
+    @app.get("/projects/{pid}/files")
+    def list_project_root(pid: str):
+        p = _project_or_404(pid)
+        root = Path(p.root)
+        root.mkdir(parents=True, exist_ok=True)
+        return _dir_listing(root, "")
+
+    @app.get("/projects/{pid}/files/{path:path}")
+    def get_project_path(pid: str, path: str):
+        p = _project_or_404(pid)
+        full = _resolve_or_400(p, path)
+        if not full.exists():
+            raise HTTPException(404, "not found")
+        if full.is_dir():
+            return _dir_listing(full, projects.relative_to_root(p, full))
+        return FileResponse(full, filename=full.name)
+
+    @app.put("/projects/{pid}/files/{path:path}")
+    async def put_project_file(pid: str, path: str, request: Request):
+        p = _project_or_404(pid)
+        full = _resolve_or_400(p, path)
+        full.parent.mkdir(parents=True, exist_ok=True)
+        body = await request.body()
+        full.write_bytes(body)
+        return {
+            "ok": True,
+            "path": projects.relative_to_root(p, full),
+            "size": len(body),
+        }
+
+    @app.delete("/projects/{pid}/files/{path:path}")
+    def delete_project_path(pid: str, path: str):
+        p = _project_or_404(pid)
+        full = _resolve_or_400(p, path)
+        if not full.exists():
+            raise HTTPException(404, "not found")
+        if full.is_dir():
+            try:
+                full.rmdir()  # only removes empty dirs — protective default
+            except OSError as e:
+                raise HTTPException(409, f"directory not empty: {e}")
+        else:
+            full.unlink()
+        return {"ok": True}
+
+    @app.post("/projects/{pid}/files/{path:path}")
+    def post_project_path(pid: str, path: str, op: str = ""):
+        p = _project_or_404(pid)
+        if op == "mkdir":
+            full = _resolve_or_400(p, path)
+            full.mkdir(parents=True, exist_ok=True)
+            return {"ok": True, "path": projects.relative_to_root(p, full)}
+        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir)")
+
     @app.get("/agents/{name}/sessions/{sid}/history")
     def get_history(name: str, sid: str):
         if not runtime.session_exists(conn, sid, name):
@@ -202,6 +372,12 @@ def create_app(config: Config) -> FastAPI:
     # ------------------------------------------------------------------
     # File transfer: shared uploads bucket + arbitrary workspace downloads
     # ------------------------------------------------------------------
+
+    def _uploads_base(sid: str, agent) -> Path:
+        """Where uploads for this session land: project root when the session
+        is bound to a project, otherwise the agent's workspace."""
+        proj = runtime.session_project(conn, sid)
+        return Path(proj.root) if proj is not None else agent.workspace
 
     @app.post("/agents/{name}/sessions/{sid}/uploads")
     async def upload_file(name: str, sid: str, file: UploadFile = File(...)):
@@ -213,8 +389,9 @@ def create_app(config: Config) -> FastAPI:
         if not file.filename:
             raise HTTPException(400, "missing filename")
 
+        upload_base = _uploads_base(sid, agent)
         try:
-            dest = ws.reserve_upload_filename(agent.workspace, file.filename)
+            dest = ws.reserve_upload_filename(upload_base, file.filename)
         except ws.WorkspaceError as e:
             raise HTTPException(400, str(e))
 
@@ -233,7 +410,9 @@ def create_app(config: Config) -> FastAPI:
                     raise HTTPException(413, f"upload exceeds {UPLOAD_MAX_BYTES} bytes")
                 out.write(chunk)
 
-        rel = ws.relative_to_workspace(agent.workspace, dest)
+        # `dest` is inside upload_base (project root or workspace); express it
+        # relative to that base for storage + wire response.
+        rel = ws.relative_to_workspace(upload_base, dest)
         runtime.append_message(
             conn,
             sid,
@@ -248,7 +427,7 @@ def create_app(config: Config) -> FastAPI:
             raise HTTPException(404, "unknown agent")
         if not runtime.session_exists(conn, sid, name):
             raise HTTPException(404, "unknown session")
-        uploads = ws.uploads_dir(agent.workspace)
+        uploads = ws.uploads_dir(_uploads_base(sid, agent))
         if not uploads.is_dir():
             return []
         entries = []
@@ -260,18 +439,84 @@ def create_app(config: Config) -> FastAPI:
                 )
         return entries
 
-    @app.get("/agents/{name}/files/{path:path}")
-    def download_file(name: str, path: str):
+    def _workspace_or_404(name: str):
         agent = config.agents.get(name)
         if agent is None:
             raise HTTPException(404, "unknown agent")
+        return agent
+
+    def _workspace_resolve_or_400(agent, relative: str) -> Path:
         try:
-            full = ws.resolve(agent.workspace, path)
+            return ws.resolve(agent.workspace, relative)
         except ws.WorkspaceError as e:
             raise HTTPException(400, str(e))
-        if not full.is_file():
+
+    def _workspace_dir_listing(target: Path, relative: str) -> dict:
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
+            st = child.stat()
+            entries.append(
+                {
+                    "name": child.name,
+                    "is_dir": child.is_dir(),
+                    "size": st.st_size if child.is_file() else 0,
+                    "mtime": int(st.st_mtime * 1000),
+                }
+            )
+        return {"path": relative, "entries": entries}
+
+    @app.get("/agents/{name}/files")
+    def list_workspace_root(name: str):
+        agent = _workspace_or_404(name)
+        agent.workspace.mkdir(parents=True, exist_ok=True)
+        return _workspace_dir_listing(agent.workspace, "")
+
+    @app.get("/agents/{name}/files/{path:path}")
+    def get_workspace_path(name: str, path: str):
+        agent = _workspace_or_404(name)
+        full = _workspace_resolve_or_400(agent, path)
+        if not full.exists():
             raise HTTPException(404, "not found")
+        if full.is_dir():
+            return _workspace_dir_listing(full, ws.relative_to_workspace(agent.workspace, full))
         return FileResponse(full, filename=full.name)
+
+    @app.put("/agents/{name}/files/{path:path}")
+    async def put_workspace_file(name: str, path: str, request: Request):
+        agent = _workspace_or_404(name)
+        full = _workspace_resolve_or_400(agent, path)
+        full.parent.mkdir(parents=True, exist_ok=True)
+        body = await request.body()
+        full.write_bytes(body)
+        return {
+            "ok": True,
+            "path": ws.relative_to_workspace(agent.workspace, full),
+            "size": len(body),
+        }
+
+    @app.delete("/agents/{name}/files/{path:path}")
+    def delete_workspace_path(name: str, path: str):
+        agent = _workspace_or_404(name)
+        full = _workspace_resolve_or_400(agent, path)
+        if not full.exists():
+            raise HTTPException(404, "not found")
+        if full.is_dir():
+            try:
+                full.rmdir()  # only empty dirs — protective default, same as projects
+            except OSError as e:
+                raise HTTPException(409, f"directory not empty: {e}")
+        else:
+            full.unlink()
+        return {"ok": True}
+
+    @app.post("/agents/{name}/files/{path:path}")
+    def post_workspace_path(name: str, path: str, op: str = ""):
+        agent = _workspace_or_404(name)
+        if op == "mkdir":
+            full = _workspace_resolve_or_400(agent, path)
+            full.mkdir(parents=True, exist_ok=True)
+            return {"ok": True, "path": ws.relative_to_workspace(agent.workspace, full)}
+        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir)")
 
     # ------------------------------------------------------------------
     # Unified per-client event stream + cross-session catch-up
@@ -448,6 +693,18 @@ def _check_bearer(header: str, expected: str) -> bool:
 def _qs_token(ws: WebSocket) -> str:
     token = ws.query_params.get("token")
     return f"Bearer {token}" if token else ""
+
+
+def _project_to_json(p) -> dict:
+    return {
+        "id": p.id,
+        "name": p.name,
+        "root": p.root,
+        "description": p.description,
+        "project_context": p.project_context,
+        "created_at": p.created_at,
+        "deleted_at": p.deleted_at,
+    }
 
 
 def _message_to_json(msg: Any) -> dict:

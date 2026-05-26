@@ -70,6 +70,27 @@ class SharedFile:
 
 
 @dataclass
+class Project:
+    """A shared, user-visible working directory that one or more sessions can be
+    bound to.
+
+    Unlike an agent's workspace (which is per-agent and private), a project's
+    root is intended to be inspected and edited by clients (file browser /
+    upload / edit) and watched for changes that fan out to live subscribers.
+    Soft-deletable — `deleted_at` is set on delete, files on disk are not
+    touched.
+    """
+
+    id: str
+    name: str
+    root: str            # absolute filesystem path
+    description: str = ""
+    project_context: str = ""  # appended to system prompt for project sessions
+    created_at: int = 0
+    deleted_at: int | None = None
+
+
+@dataclass
 class SessionContext:
     """Client-supplied per-session instructions, layered onto the system prompt.
 

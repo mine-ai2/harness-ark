@@ -5,7 +5,11 @@ hand files back to clients. Bytes move over REST; coordination rides the
 existing WebSocket and message history.
 
 For session creation, history, per-session context, and the WebSocket
-protocol overview, see [sessions.md](sessions.md).
+protocol overview, see [sessions.md](sessions.md). For the higher-level
+**project** abstraction (shared user-visible working directories), see
+[projects.md](projects.md). The browsable / editable REST surface for
+agent workspaces is documented below under
+[Workspace filesystem API](#workspace-filesystem-api).
 
 ## Where files live
 
@@ -173,6 +177,69 @@ text for shared files), so the model sees a complete and coherent transcript.
   client with the bearer token. The token is the only credential.
 - **Server-initiated push.** Files only become visible to clients when the
   agent explicitly calls `share_with_client`. There's no inbox-watching.
+
+## Workspace filesystem API
+
+In addition to the session-scoped upload flow above, every agent's workspace
+is browsable / editable directly over REST. Same shape as the per-project
+filesystem API ([projects.md](projects.md)); same path-traversal
+protections; same live `file_changed` events.
+
+```
+GET    /agents/{name}/files                 # list workspace root
+GET    /agents/{name}/files/{path}          # file → bytes; dir → JSON listing
+PUT    /agents/{name}/files/{path}          # write file (raw body)
+DELETE /agents/{name}/files/{path}          # delete file or empty dir
+POST   /agents/{name}/files/{path}?op=mkdir
+```
+
+Listings return:
+
+```json
+{
+  "path": "scratch",
+  "entries": [
+    {"name": "draft.md", "is_dir": false, "size": 1234, "mtime": 1779000000000},
+    {"name": "subdir",   "is_dir": true,  "size": 0,    "mtime": 1779000000000}
+  ]
+}
+```
+
+Path traversal is enforced — `..`, absolute paths, encoded variants, and
+symlinks that escape the workspace root all return `400`.
+
+### Live workspace change events
+
+Each agent's workspace is also watched for filesystem changes. Events fan
+out over the unified `/events` WS as:
+
+```json
+{
+  "type": "workspace_file_changed",
+  "agent_name": "scribe",
+  "path": "scratch/draft.md",
+  "change": "created" | "modified" | "deleted"
+}
+```
+
+Same coalescing window (~200ms) and ignore-list (`.git`, `node_modules`,
+`__pycache__`, `.pytest_cache`, `.venv`, `.DS_Store`, `.idea`, `.vscode`)
+as `project_file_changed`. Move events surface as a delete on the source
+path followed by a create on the destination.
+
+### When to use workspace vs. project endpoints
+
+| | Workspace | Project |
+|---|---|---|
+| Scope | One agent's private scratch space | Shared across one or more sessions / agents |
+| User-visible "thing" | Usually no — debugging or inspection | Yes — the user's working artifact |
+| Default upload destination | When session is **not** in a project | When session **is** in a project |
+| Live change events | `workspace_file_changed`, keyed by `agent_name` | `project_file_changed`, keyed by `project_id` |
+
+In short: projects are first-class collaboration surfaces with their own
+lifecycle (`POST /projects`, soft-delete, etc.); the workspace endpoints
+exist so you can also poke around an agent's private space when you need
+to.
 
 ## Security notes
 
