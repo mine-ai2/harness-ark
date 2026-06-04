@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — File rename
+
+Adds an `op=rename` action to the file management `POST` handler on both
+the project and workspace filesystem endpoints. Works on files and
+directories, never silently overwrites, and applies path-traversal checks
+to both source and destination.
+
+```
+POST /projects/{id}/files/{path}?op=rename&dest=<dest>
+POST /agents/{name}/files/{path}?op=rename&dest=<dest>
+```
+
+Responses on success: `{"ok": true, "from": "<old>", "to": "<new>"}`.
+Errors: `400` if `dest` is missing or escapes the root; `404` if the
+source doesn't exist; `409` if `dest` already exists.
+
 ## Unreleased — Workspace filesystem REST + live events
 
 Adds a browsable / editable REST surface for an agent's workspace,

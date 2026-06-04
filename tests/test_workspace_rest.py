@@ -125,6 +125,66 @@ def test_mkdir(ark_home, tmp_path):
     assert (ws / "scratch").is_dir()
 
 
+def test_rename_file(ark_home, tmp_path):
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "old.txt").write_text("hi")
+    r = client.post(
+        "/agents/scribe/files/old.txt?op=rename&dest=new.txt", headers=H
+    )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "from": "old.txt", "to": "new.txt"}
+    assert (ws / "new.txt").read_text() == "hi"
+
+
+def test_rename_into_subdir(ark_home, tmp_path):
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "a.txt").write_text("a")
+    r = client.post(
+        "/agents/scribe/files/a.txt?op=rename&dest=archive/a.txt", headers=H
+    )
+    assert r.status_code == 200
+    assert (ws / "archive/a.txt").read_text() == "a"
+
+
+def test_rename_directory(ark_home, tmp_path):
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "olddir").mkdir()
+    (ws / "olddir" / "x.txt").write_text("x")
+    r = client.post(
+        "/agents/scribe/files/olddir?op=rename&dest=newdir", headers=H
+    )
+    assert r.status_code == 200
+    assert (ws / "newdir" / "x.txt").read_text() == "x"
+
+
+def test_rename_missing_source_404(ark_home, tmp_path):
+    client, _ = _client(ark_home, tmp_path)
+    r = client.post(
+        "/agents/scribe/files/no-such?op=rename&dest=other", headers=H
+    )
+    assert r.status_code == 404
+
+
+def test_rename_409_on_existing_dest(ark_home, tmp_path):
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "a.txt").write_text("a")
+    (ws / "b.txt").write_text("b")
+    r = client.post(
+        "/agents/scribe/files/a.txt?op=rename&dest=b.txt", headers=H
+    )
+    assert r.status_code == 409
+
+
+def test_rename_dest_traversal_blocked(ark_home, tmp_path):
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "a.txt").write_text("a")
+    r = client.post(
+        "/agents/scribe/files/a.txt?op=rename&dest=../outside.txt", headers=H
+    )
+    assert r.status_code == 400
+    assert (ws / "a.txt").exists()  # source untouched
+
+
 def test_post_unknown_op(ark_home, tmp_path):
     client, _ = _client(ark_home, tmp_path)
     r = client.post("/agents/scribe/files/x?op=banana", headers=H)

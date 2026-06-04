@@ -355,13 +355,33 @@ def create_app(config: Config) -> FastAPI:
         return {"ok": True}
 
     @app.post("/projects/{pid}/files/{path:path}")
-    def post_project_path(pid: str, path: str, op: str = ""):
+    def post_project_path(pid: str, path: str, op: str = "", dest: str = ""):
         p = _project_or_404(pid)
         if op == "mkdir":
             full = _resolve_or_400(p, path)
             full.mkdir(parents=True, exist_ok=True)
             return {"ok": True, "path": projects.relative_to_root(p, full)}
-        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir)")
+        if op == "rename":
+            if not dest:
+                raise HTTPException(400, "?dest=<path> is required for op=rename")
+            src = _resolve_or_400(p, path)
+            dst = _resolve_or_400(p, dest)
+            if not src.exists():
+                raise HTTPException(404, "source not found")
+            if dst.exists():
+                raise HTTPException(409, "destination already exists")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            # shutil.move handles cross-filesystem moves transparently;
+            # Path.rename would raise EXDEV in that case.
+            import shutil
+
+            shutil.move(str(src), str(dst))
+            return {
+                "ok": True,
+                "from": projects.relative_to_root(p, src),
+                "to": projects.relative_to_root(p, dst),
+            }
+        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir or ?op=rename)")
 
     @app.get("/agents/{name}/sessions/{sid}/history")
     def get_history(name: str, sid: str):
@@ -510,13 +530,31 @@ def create_app(config: Config) -> FastAPI:
         return {"ok": True}
 
     @app.post("/agents/{name}/files/{path:path}")
-    def post_workspace_path(name: str, path: str, op: str = ""):
+    def post_workspace_path(name: str, path: str, op: str = "", dest: str = ""):
         agent = _workspace_or_404(name)
         if op == "mkdir":
             full = _workspace_resolve_or_400(agent, path)
             full.mkdir(parents=True, exist_ok=True)
             return {"ok": True, "path": ws.relative_to_workspace(agent.workspace, full)}
-        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir)")
+        if op == "rename":
+            if not dest:
+                raise HTTPException(400, "?dest=<path> is required for op=rename")
+            src = _workspace_resolve_or_400(agent, path)
+            dst = _workspace_resolve_or_400(agent, dest)
+            if not src.exists():
+                raise HTTPException(404, "source not found")
+            if dst.exists():
+                raise HTTPException(409, "destination already exists")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+
+            shutil.move(str(src), str(dst))
+            return {
+                "ok": True,
+                "from": ws.relative_to_workspace(agent.workspace, src),
+                "to": ws.relative_to_workspace(agent.workspace, dst),
+            }
+        raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir or ?op=rename)")
 
     # ------------------------------------------------------------------
     # Unified per-client event stream + cross-session catch-up

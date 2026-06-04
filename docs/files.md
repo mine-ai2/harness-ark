@@ -191,7 +191,16 @@ GET    /agents/{name}/files/{path}          # file → bytes; dir → JSON listi
 PUT    /agents/{name}/files/{path}          # write file (raw body)
 DELETE /agents/{name}/files/{path}          # delete file or empty dir
 POST   /agents/{name}/files/{path}?op=mkdir
+POST   /agents/{name}/files/{path}?op=rename&dest=<dest>   # move/rename
 ```
+
+`op=rename` behavior (mirrors the project endpoint):
+
+- `path` is the source, `dest` is the new location — both workspace-relative.
+- Works on files and directories (moving a directory carries its subtree).
+- Parent directories of `dest` are created if missing.
+- `404` if the source doesn't exist; `409` if `dest` already exists.
+- Path-traversal checks apply to both source and destination.
 
 Listings return:
 

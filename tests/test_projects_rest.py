@@ -211,6 +211,83 @@ def test_mkdir(ark_home, tmp_path):
     assert (Path(p["root"]) / "newdir").is_dir()
 
 
+def test_rename_file_within_same_dir(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "old.txt").write_text("hello")
+    r = client.post(
+        f"/projects/{p['id']}/files/old.txt?op=rename&dest=new.txt", headers=H
+    )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "from": "old.txt", "to": "new.txt"}
+    assert not (Path(p["root"]) / "old.txt").exists()
+    assert (Path(p["root"]) / "new.txt").read_text() == "hello"
+
+
+def test_rename_into_new_subdir(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "a.txt").write_text("a")
+    r = client.post(
+        f"/projects/{p['id']}/files/a.txt?op=rename&dest=archive/old/a.txt", headers=H
+    )
+    assert r.status_code == 200
+    assert (Path(p["root"]) / "archive/old/a.txt").read_text() == "a"
+
+
+def test_rename_directory(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "olddir").mkdir()
+    (Path(p["root"]) / "olddir" / "inner.txt").write_text("x")
+    r = client.post(
+        f"/projects/{p['id']}/files/olddir?op=rename&dest=newdir", headers=H
+    )
+    assert r.status_code == 200
+    assert (Path(p["root"]) / "newdir" / "inner.txt").read_text() == "x"
+
+
+def test_rename_requires_dest(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "a.txt").write_text("x")
+    r = client.post(f"/projects/{p['id']}/files/a.txt?op=rename", headers=H)
+    assert r.status_code == 400
+    assert "dest" in r.text
+
+
+def test_rename_404_on_missing_source(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    r = client.post(
+        f"/projects/{p['id']}/files/no-such.txt?op=rename&dest=other.txt", headers=H
+    )
+    assert r.status_code == 404
+
+
+def test_rename_409_on_existing_dest(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "a.txt").write_text("a")
+    (Path(p["root"]) / "b.txt").write_text("b")
+    r = client.post(
+        f"/projects/{p['id']}/files/a.txt?op=rename&dest=b.txt", headers=H
+    )
+    assert r.status_code == 409
+
+
+def test_rename_dest_traversal_blocked(ark_home, tmp_path):
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "a.txt").write_text("a")
+    r = client.post(
+        f"/projects/{p['id']}/files/a.txt?op=rename&dest=../outside.txt", headers=H
+    )
+    # Resolution catches it before the move runs
+    assert r.status_code == 400
+    assert (Path(p["root"]) / "a.txt").exists()  # source untouched
+
+
 def test_filesystem_endpoints_404_on_deleted_project(ark_home, tmp_path):
     client = _client(ark_home, tmp_path)
     p = _new_project(client, tmp_path)

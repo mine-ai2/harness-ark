@@ -70,8 +70,19 @@ GET    /projects/{id}/files                  # list root contents
 GET    /projects/{id}/files/{path}           # file: stream bytes; dir: list JSON
 PUT    /projects/{id}/files/{path}           # write file (raw body)
 DELETE /projects/{id}/files/{path}           # delete file (or empty dir)
-POST   /projects/{id}/files/{path}?op=mkdir  # create directory
+POST   /projects/{id}/files/{path}?op=mkdir
+POST   /projects/{id}/files/{path}?op=rename&dest=<dest>   # move/rename
 ```
+
+`op=rename` behavior:
+
+- `path` is the source, `dest` is the new location — both project-relative.
+- Works on files and directories (moving a directory carries its subtree).
+- Parent directories of `dest` are created if missing.
+- `404` if the source doesn't exist; `409` if `dest` already exists (no
+  silent overwrite).
+- `dest` is path-traversal checked the same way `path` is — any attempt to
+  rename out of the project root returns `400`.
 
 Listings return:
 
