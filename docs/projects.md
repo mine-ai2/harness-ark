@@ -69,7 +69,7 @@ read, write, and delete files through these endpoints:
 GET    /projects/{id}/files                  # list root contents
 GET    /projects/{id}/files/{path}           # file: stream bytes; dir: list JSON
 PUT    /projects/{id}/files/{path}           # write file (raw body)
-DELETE /projects/{id}/files/{path}           # delete file (or empty dir)
+DELETE /projects/{id}/files/{path}           # delete file or directory (recursive)
 POST   /projects/{id}/files/{path}?op=mkdir
 POST   /projects/{id}/files/{path}?op=rename&dest=<dest>   # move/rename
 ```

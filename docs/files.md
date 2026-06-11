@@ -189,7 +189,7 @@ protections; same live `file_changed` events.
 GET    /agents/{name}/files                 # list workspace root
 GET    /agents/{name}/files/{path}          # file → bytes; dir → JSON listing
 PUT    /agents/{name}/files/{path}          # write file (raw body)
-DELETE /agents/{name}/files/{path}          # delete file or empty dir
+DELETE /agents/{name}/files/{path}          # delete file or directory (recursive)
 POST   /agents/{name}/files/{path}?op=mkdir
 POST   /agents/{name}/files/{path}?op=rename&dest=<dest>   # move/rename
 ```

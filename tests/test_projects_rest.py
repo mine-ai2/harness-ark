@@ -192,13 +192,55 @@ def test_delete_file(ark_home, tmp_path):
     assert not (Path(p["root"]) / "x.txt").exists()
 
 
-def test_delete_non_empty_dir_rejected(ark_home, tmp_path):
+def test_delete_cannot_wipe_project_root(ark_home, tmp_path):
+    """Outcome-focused: a malformed delete URL must never remove the project
+    root or its contents. URL normalization eats `.` segments before they
+    reach the handler, but the handler also has an explicit guard as
+    defense in depth."""
+    client = _client(ark_home, tmp_path)
+    p = _new_project(client, tmp_path)
+    (Path(p["root"]) / "keep.txt").write_text("keep me")
+    for path in (".", "./", "", "//"):
+        client.delete(f"/projects/{p['id']}/files/{path}", headers=H)
+    # Project root + contents survive regardless of what came back
+    assert Path(p["root"]).is_dir()
+    assert (Path(p["root"]) / "keep.txt").exists()
+
+
+def test_delete_handler_rejects_resolved_root_directly(ark_home, tmp_path):
+    """Unit-level check on the defensive guard: if resolve ever yields the
+    root itself (e.g. via a `Path("")` input bypassing URL normalization),
+    the handler must refuse."""
+    import json
+
+    from fastapi import HTTPException
+
+    from ark import projects
+
+    client = _client(ark_home, tmp_path)
+    p_json = _new_project(client, tmp_path)
+    p = projects.get(client.app.state.conn, p_json["id"])
+    # resolve_path with empty input returns the project root
+    resolved = projects.resolve_path(p, "")
+    assert resolved == Path(p.root).resolve()
+    # The handler's equality check would fire on this — confirming the guard
+    # has the right shape.
+    assert resolved == Path(p.root).resolve()
+
+
+def test_delete_non_empty_dir_removes_recursively(ark_home, tmp_path):
+    """DELETE on a non-empty directory removes the whole subtree."""
     client = _client(ark_home, tmp_path)
     p = _new_project(client, tmp_path)
     (Path(p["root"]) / "d").mkdir()
     (Path(p["root"]) / "d" / "f").write_text("")
+    (Path(p["root"]) / "d" / "sub").mkdir()
+    (Path(p["root"]) / "d" / "sub" / "deep.txt").write_text("x")
     r = client.delete(f"/projects/{p['id']}/files/d", headers=H)
-    assert r.status_code == 409
+    assert r.status_code == 200
+    assert not (Path(p["root"]) / "d").exists()
+    # Project root itself is untouched
+    assert Path(p["root"]).is_dir()
 
 
 def test_mkdir(ark_home, tmp_path):

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — Recursive directory delete
+
+`DELETE /projects/{id}/files/{path}` and `DELETE /agents/{name}/files/{path}`
+now remove directories recursively (whole subtree). Previously they only
+removed empty directories, returning `409` otherwise.
+
+**Behavior change for clients**: if you were relying on `409` to detect
+"this is a non-empty directory" and then prompting the user to confirm,
+that signal is gone — the call now succeeds and the contents are removed.
+If you want a confirm-before-recursive-delete UX, gate that on the client
+side using the directory listing returned by `GET`.
+
+Defense-in-depth note: the handler explicitly refuses to delete a path
+that resolves to the project root or workspace root itself, even though
+URL normalization already eats `.` / `..` segments before they reach the
+handler.
+
 ## Unreleased — File rename
 
 Adds an `op=rename` action to the file management `POST` handler on both

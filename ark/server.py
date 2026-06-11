@@ -343,13 +343,17 @@ def create_app(config: Config) -> FastAPI:
     def delete_project_path(pid: str, path: str):
         p = _project_or_404(pid)
         full = _resolve_or_400(p, path)
+        # Defense in depth: never let a malformed path resolve to the root
+        # itself and wipe the project.
+        if full == Path(p.root).resolve():
+            raise HTTPException(400, "cannot delete the project root")
         if not full.exists():
             raise HTTPException(404, "not found")
         if full.is_dir():
-            try:
-                full.rmdir()  # only removes empty dirs — protective default
-            except OSError as e:
-                raise HTTPException(409, f"directory not empty: {e}")
+            # Recursive removal — non-empty directories delete cleanly.
+            import shutil
+
+            shutil.rmtree(full)
         else:
             full.unlink()
         return {"ok": True}
@@ -518,13 +522,16 @@ def create_app(config: Config) -> FastAPI:
     def delete_workspace_path(name: str, path: str):
         agent = _workspace_or_404(name)
         full = _workspace_resolve_or_400(agent, path)
+        # Defense in depth: never let a malformed path resolve to the
+        # workspace root itself.
+        if full == Path(agent.workspace).resolve():
+            raise HTTPException(400, "cannot delete the workspace root")
         if not full.exists():
             raise HTTPException(404, "not found")
         if full.is_dir():
-            try:
-                full.rmdir()  # only empty dirs — protective default, same as projects
-            except OSError as e:
-                raise HTTPException(409, f"directory not empty: {e}")
+            import shutil
+
+            shutil.rmtree(full)
         else:
             full.unlink()
         return {"ok": True}

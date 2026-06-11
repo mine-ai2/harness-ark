@@ -110,12 +110,29 @@ def test_delete_file(ark_home, tmp_path):
     assert not (ws / "doomed.txt").exists()
 
 
-def test_delete_non_empty_dir_rejected(ark_home, tmp_path):
+def test_delete_non_empty_dir_removes_recursively(ark_home, tmp_path):
+    """DELETE on a non-empty directory removes the whole subtree."""
     client, ws = _client(ark_home, tmp_path)
     (ws / "d").mkdir()
     (ws / "d" / "f").write_text("")
+    (ws / "d" / "sub").mkdir()
+    (ws / "d" / "sub" / "deep.txt").write_text("x")
     r = client.delete("/agents/scribe/files/d", headers=H)
-    assert r.status_code == 409
+    assert r.status_code == 200
+    assert not (ws / "d").exists()
+    # Workspace itself is untouched
+    assert ws.is_dir()
+
+
+def test_delete_cannot_wipe_workspace_root(ark_home, tmp_path):
+    """Outcome-focused: malformed delete URLs must never wipe the workspace
+    root or its contents."""
+    client, ws = _client(ark_home, tmp_path)
+    (ws / "keep.txt").write_text("keep me")
+    for path in (".", "./", "", "//"):
+        client.delete(f"/agents/scribe/files/{path}", headers=H)
+    assert ws.is_dir()
+    assert (ws / "keep.txt").exists()
 
 
 def test_mkdir(ark_home, tmp_path):
