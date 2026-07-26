@@ -40,6 +40,56 @@ def test_read_and_write_file(tmp_path):
     assert output == "hello"
 
 
+def test_write_file_refuses_other_agent_workspace(tmp_path):
+    """An agent shouldn't be able to scribble into a peer agent's workspace.
+    read_file / run_command are intentionally NOT restricted this way — the
+    concern here is preventing accidental / adversarial cross-writes."""
+    from ark.config import AgentConfig, Config, ProviderConfig, ServerConfig
+
+    my_ws = tmp_path / "mine"
+    my_ws.mkdir()
+    peer_ws = tmp_path / "peer"
+    peer_ws.mkdir()
+
+    me = AgentConfig(name="me", provider="a", model="m", workspace=my_ws)
+    peer = AgentConfig(name="peer", provider="a", model="m", workspace=peer_ws)
+    cfg = Config(
+        server=ServerConfig(host="127.0.0.1", port=7777, auth_secret="x"),
+        providers={"a": ProviderConfig(provider_type="anthropic", api_key="k")},
+        tools={},
+        agents={"me": me, "peer": peer},
+    )
+    ctx = ToolContext(
+        conn=MagicMock(), config=cfg, agent=me, session_id="s",
+        cwd=my_ws, loaded_skills=set(),
+    )
+
+    # Own workspace: fine
+    own_target = my_ws / "note.md"
+    output, err = run("write_file", {"path": str(own_target), "content": "mine"}, ctx)
+    assert err is False
+    assert own_target.read_text() == "mine"
+
+    # Peer's workspace: refused
+    peer_target = peer_ws / "note.md"
+    output, err = run(
+        "write_file", {"path": str(peer_target), "content": "sneaky"}, ctx
+    )
+    assert err is True
+    assert "another agent's workspace" in output
+    assert "peer" in output
+    assert not peer_target.exists()
+
+    # Peer's nested subdir: also refused
+    output, err = run(
+        "write_file",
+        {"path": str(peer_ws / "sub" / "deep.md"), "content": "sneakier"},
+        ctx,
+    )
+    assert err is True
+    assert not (peer_ws / "sub").exists()
+
+
 def test_read_missing_file_errors(tmp_path):
     ctx = make_ctx(tmp_path)
     output, err = run("read_file", {"path": str(tmp_path / "nope")}, ctx)

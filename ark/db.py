@@ -80,6 +80,18 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_sessions_project ON sessions(project_id);
         """,
     ),
+    (
+        4,
+        # Track which cron entry triggered each cron-kind session, so we can
+        # query "show me the fires of cron X" without trying to infer from
+        # the prompt text. Sessions that aren't cron fires keep this NULL.
+        # No FK to crons: sessions outlive cron edits/deletions and the
+        # cron_id label is meant to be stable even if the cron is later removed.
+        """
+        ALTER TABLE sessions ADD COLUMN cron_id TEXT;
+        CREATE INDEX idx_sessions_cron ON sessions(agent_name, cron_id, created_at DESC);
+        """,
+    ),
 ]
 
 

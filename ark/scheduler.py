@@ -129,13 +129,21 @@ class Scheduler:
         await self._drive(agent_name, "heartbeat", prompt)
 
     async def _fire_cron(self, agent_name: str, cron_id: str, prompt: str) -> None:
-        await self._drive(agent_name, "cron", prompt)
+        await self._drive(agent_name, "cron", prompt, cron_id=cron_id)
 
-    async def _drive(self, agent_name: str, kind: str, prompt: str) -> None:
+    async def _drive(
+        self,
+        agent_name: str,
+        kind: str,
+        prompt: str,
+        cron_id: str | None = None,
+    ) -> None:
         agent = self.config.agents.get(agent_name)
         if agent is None:
             return
-        sid = runtime.create_session(self.conn, agent_name, kind=kind)
+        sid = runtime.create_session(
+            self.conn, agent_name, kind=kind, cron_id=cron_id
+        )
         try:
             # run_and_publish routes events through the broker so connected
             # clients on the unified /events WS see scheduled-session activity

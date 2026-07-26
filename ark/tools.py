@@ -81,7 +81,22 @@ def _read_file(*, path: str) -> str:
 
 
 def _write_file(*, path: str, content: str) -> str:
-    p = Path(path).expanduser()
+    p = Path(path).expanduser().resolve()
+    # An agent must not be able to scribble into *other* agents' workspaces.
+    # (run_command is intentionally exempt — it's the shell escape hatch.)
+    ctx = current_context()
+    for other_name, other_agent in ctx.config.agents.items():
+        if other_name == ctx.agent.name:
+            continue
+        other_ws = Path(other_agent.workspace).resolve()
+        try:
+            p.relative_to(other_ws)
+        except ValueError:
+            continue
+        raise ToolError(
+            f"refusing to write to another agent's workspace "
+            f"({other_name!r} owns {other_ws})"
+        )
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return f"wrote {len(content)} bytes to {p}"

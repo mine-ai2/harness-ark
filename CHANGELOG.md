@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — Cron fire history + session metadata + ark show
+
+For debugging "what did this cron actually do," the scheduler now records
+which cron entry triggered each fire, and there are dedicated endpoints +
+CLI commands for inspecting the history.
+
+### Schema migration v4
+
+Adds `sessions.cron_id TEXT` (nullable). Populated only for sessions
+created by the scheduler firing that cron. Existing sessions stay `NULL`.
+No backfill — history starts now.
+
+### New REST endpoints
+
+```
+GET /sessions/{sid}
+  → { id, agent_name, kind, created_at, ended_at, project_id, cron_id,
+      cron_prompt? }   # cron_prompt present only when kind='cron'
+
+GET /agents/{name}/crons/{cron_id}/sessions?limit=N
+  → [ { session_id, created_at, ended_at, had_error, error_code, summary }, … ]
+```
+
+`summary` resolution order: first `post_to_session.body` (covers the most
+common cron pattern — "send a briefing"), then last `AssistantText`, then
+`"(no output)"` for fires that produced nothing (Gemini safety filter,
+empty user input, etc.).
+
+`had_error` + `error_code` come from any `RunError` row persisted during
+the run.
+
+### New CLI commands
+
+```
+ark cron history <agent> <cron-id> [--limit 20]
+ark show <session-id>
+```
+
+`ark show` works for any session kind (cron, heartbeat, conversational).
+It collapses turns into a readable transcript, surfaces `RunError` and
+`TurnMetrics` rows inline, and prints the cron prompt when applicable.
+
 ## Unreleased — Recursive directory delete
 
 `DELETE /projects/{id}/files/{path}` and `DELETE /agents/{name}/files/{path}`

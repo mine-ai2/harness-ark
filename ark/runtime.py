@@ -90,11 +90,13 @@ def create_session(
     agent_name: str,
     kind: str = "conversational",
     project_id: str | None = None,
+    cron_id: str | None = None,
 ) -> str:
     sid = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO sessions(id, agent_name, kind, created_at, project_id) VALUES (?,?,?,?,?)",
-        (sid, agent_name, kind, now_ms(), project_id),
+        "INSERT INTO sessions(id, agent_name, kind, created_at, project_id, cron_id) "
+        "VALUES (?,?,?,?,?,?)",
+        (sid, agent_name, kind, now_ms(), project_id, cron_id),
     )
     return sid
 

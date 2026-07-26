@@ -564,6 +564,125 @@ def cmd_cron_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cron_history(args: argparse.Namespace) -> int:
+    base_url, secret = _client_settings()
+    r = httpx.get(
+        f"{base_url}/agents/{args.agent}/crons/{args.id}/sessions",
+        headers=_headers(secret),
+        params={"limit": args.limit},
+        timeout=10,
+    )
+    if r.status_code == 404:
+        print(f"unknown agent: {args.agent}", file=sys.stderr)
+        return 1
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        print(f"(no fires recorded for cron '{args.id}')")
+        return 0
+    print(f"{'SESSION':38s}  {'FIRED':19s}  {'STATUS':7s}  SUMMARY")
+    for row in rows:
+        sid = row["session_id"]
+        ts = datetime.fromtimestamp(row["created_at"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        if row.get("had_error"):
+            status = "error"
+        elif row.get("summary", "(no output)") == "(no output)":
+            status = "empty"
+        else:
+            status = "ok"
+        # Summary printed as a single line — collapse newlines, truncate.
+        summary = " ".join((row.get("summary") or "").split())
+        if status == "error":
+            summary = f"{row.get('error_code') or 'other'}: {summary}".strip(": ")
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        print(f"{sid:38s}  {ts}  {status:7s}  {summary}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """Pretty-print a session transcript. Works for any session kind."""
+    base_url, secret = _client_settings()
+    headers = _headers(secret)
+    # Metadata first
+    r = httpx.get(f"{base_url}/sessions/{args.session_id}", headers=headers, timeout=10)
+    if r.status_code == 404:
+        print(f"unknown session: {args.session_id}", file=sys.stderr)
+        return 1
+    r.raise_for_status()
+    meta = r.json()
+    # Full history
+    r = httpx.get(
+        f"{base_url}/agents/{meta['agent_name']}/sessions/{args.session_id}/history",
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    history = r.json()
+    _format_session(meta, history)
+    return 0
+
+
+def _format_session(meta: dict, history: list[dict]) -> None:
+    kind = meta["kind"]
+    sid = meta["id"]
+    created = datetime.fromtimestamp(meta["created_at"] / 1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+    header = f"=== {kind} session {sid} ({meta['agent_name']}, fired {created}) ==="
+    print(header)
+    if meta.get("cron_id"):
+        print(f"cron: {meta['cron_id']}")
+    if meta.get("cron_prompt"):
+        prompt_preview = meta["cron_prompt"]
+        if len(prompt_preview) > 200:
+            prompt_preview = prompt_preview[:200] + "…"
+        print(f"prompt: {prompt_preview!r}")
+    if meta.get("project_id"):
+        print(f"project: {meta['project_id']}")
+    print()
+    turn_index = 0
+    for m in history:
+        k = m["kind"]
+        d = m.get("data", {})
+        if k == "UserText":
+            turn_index += 1
+            print(f"[turn {turn_index}] user> {_truncate(d.get('text', ''), 200)}")
+        elif k == "AssistantText":
+            text = d.get("text") or ""
+            if text:
+                print(f"  → {_truncate(text, 200)}")
+        elif k == "InjectedMessage":
+            print(f"  ← injected from {d.get('from_session_id', '')[:8]}…: {_truncate(d.get('text', ''), 120)}")
+        elif k == "ToolCall":
+            name = d.get("name", "?")
+            inp = d.get("input") or {}
+            arg_summary = ", ".join(f"{k}=…" for k in list(inp.keys())[:3])
+            print(f"  → tool: {name}({arg_summary})")
+        elif k == "ToolResult":
+            err = " ✗" if d.get("is_error") else ""
+            out = (d.get("output") or "").strip()
+            print(f"     ↳{err} {_truncate(out, 120)}")
+        elif k == "UploadMessage":
+            print(f"  ← upload: {d.get('original_name')} → {d.get('path')} ({d.get('size')} bytes)")
+        elif k == "SharedFile":
+            desc = f" — {d['description']}" if d.get("description") else ""
+            print(f"  → shared: {d.get('path')} ({d.get('size')} bytes){desc}")
+        elif k == "TurnMetrics":
+            print(f"     [metrics: in={d.get('input_tokens')} out={d.get('output_tokens')}]")
+        elif k == "RunError":
+            print(f"  ✗ error: {d.get('code')} — {_truncate(d.get('message', ''), 200)}")
+        elif k == "SessionContext":
+            print(f"  [context: {_truncate(d.get('text', ''), 200)}]")
+        else:
+            print(f"  [{k}]")
+
+
+def _truncate(s: str, n: int) -> str:
+    s = " ".join(s.split())  # collapse whitespace
+    if len(s) <= n:
+        return s
+    return s[:n] + "…"
+
+
 # ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
@@ -667,5 +786,19 @@ def build_parser() -> argparse.ArgumentParser:
     cron_remove.add_argument("agent")
     cron_remove.add_argument("id")
     cron_remove.set_defaults(func=cmd_cron_remove)
+
+    cron_history = cron_sub.add_parser(
+        "history", help="show recent fires of a specific cron entry"
+    )
+    cron_history.add_argument("agent")
+    cron_history.add_argument("id")
+    cron_history.add_argument("--limit", type=int, default=20)
+    cron_history.set_defaults(func=cmd_cron_history)
+
+    show = sub.add_parser(
+        "show", help="pretty-print a session's transcript (any session kind)"
+    )
+    show.add_argument("session_id")
+    show.set_defaults(func=cmd_show)
 
     return parser

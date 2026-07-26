@@ -116,6 +116,71 @@ def create_app(config: Config) -> FastAPI:
             )
         return {"ok": True}
 
+    @app.get("/agents/{name}/crons/{cron_id}/sessions")
+    def list_cron_fires(name: str, cron_id: str, limit: int = 20):
+        """List the past fires (sessions) of a specific cron entry, newest
+        first. Enriched with a one-line summary + error metadata so clients
+        can render a tabular log without a round-trip per row."""
+
+        if name not in config.agents:
+            raise HTTPException(404, "unknown agent")
+        limit = max(1, min(int(limit), 200))
+        rows = conn.execute(
+            "SELECT id, created_at, ended_at FROM sessions "
+            "WHERE agent_name = ? AND cron_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (name, cron_id, limit),
+        ).fetchall()
+        out = []
+        for r in rows:
+            sid = r["id"]
+            # First post_to_session call's body is the most useful summary
+            # for the common "cron messages the user" pattern. Otherwise the
+            # last assistant text. Otherwise "(no output)".
+            summary = "(no output)"
+            for tc in conn.execute(
+                "SELECT content_json FROM messages WHERE session_id = ? "
+                "AND role = 'tool_call' ORDER BY id",
+                (sid,),
+            ):
+                c = json.loads(tc["content_json"])
+                if c.get("name") == "post_to_session":
+                    body = (c.get("input") or {}).get("body") or ""
+                    if body:
+                        summary = body
+                        break
+            if summary == "(no output)":
+                last_text = conn.execute(
+                    "SELECT content_json FROM messages WHERE session_id = ? "
+                    "AND role = 'assistant' ORDER BY id DESC LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                if last_text is not None:
+                    txt = json.loads(last_text["content_json"]).get("text") or ""
+                    if txt:
+                        summary = txt
+            # Error info — pull the most recent run_error row if any.
+            err_row = conn.execute(
+                "SELECT content_json FROM messages WHERE session_id = ? "
+                "AND role = 'run_error' ORDER BY id DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            had_error = err_row is not None
+            error_code = None
+            if had_error:
+                error_code = json.loads(err_row["content_json"]).get("code")
+            out.append(
+                {
+                    "session_id": sid,
+                    "created_at": r["created_at"],
+                    "ended_at": r["ended_at"],
+                    "had_error": had_error,
+                    "error_code": error_code,
+                    "summary": summary[:300],
+                }
+            )
+        return out
+
     @app.get("/agents/{name}/crons")
     def list_crons(name: str):
         if name not in config.agents:
@@ -386,6 +451,27 @@ def create_app(config: Config) -> FastAPI:
                 "to": projects.relative_to_root(p, dst),
             }
         raise HTTPException(400, f"unsupported op: {op!r} (try ?op=mkdir or ?op=rename)")
+
+    @app.get("/sessions/{sid}")
+    def get_session_metadata(sid: str):
+        """Session metadata: id, agent_name, kind, timestamps, project + cron
+        bindings. When this is a cron-kind session, also include the cron's
+        prompt for transcript readability."""
+        row = conn.execute(
+            "SELECT id, agent_name, kind, created_at, ended_at, project_id, cron_id "
+            "FROM sessions WHERE id = ?",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "unknown session")
+        body = dict(row)
+        if body["cron_id"]:
+            cron_row = conn.execute(
+                "SELECT prompt FROM crons WHERE agent_name = ? AND id = ?",
+                (body["agent_name"], body["cron_id"]),
+            ).fetchone()
+            body["cron_prompt"] = cron_row["prompt"] if cron_row else None
+        return body
 
     @app.get("/agents/{name}/sessions/{sid}/history")
     def get_history(name: str, sid: str):

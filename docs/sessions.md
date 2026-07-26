@@ -292,6 +292,39 @@ any connected WS clients. See [design/design.md §8](../design/design.md) for
 the rationale; the implementation lives in [ark/broker.py](../ark/broker.py)
 and the `post_to_session` tool in [ark/tools.py](../ark/tools.py).
 
+## Session metadata + cron fire history
+
+For debugging "what did the cron actually do," two endpoints + two CLI
+commands:
+
+```
+GET /sessions/{sid}                                 # session metadata
+GET /agents/{name}/crons/{cron_id}/sessions[?limit] # fires of a specific cron
+```
+
+The metadata endpoint returns `{id, agent_name, kind, created_at, ended_at,
+project_id, cron_id, cron_prompt?}`. `cron_prompt` is present only when the
+session is a cron fire — it's the prompt from the cron entry at the time the
+fire was rendered, which makes transcripts self-explanatory.
+
+The fire-history endpoint returns each fire enriched with a one-line
+`summary` (the first `post_to_session` body, falling back to last
+`AssistantText`, falling back to `"(no output)"`), plus `had_error` and
+`error_code`. Clients can render a table without round-tripping `/history`
+per row.
+
+```bash
+ark cron history <agent> <cron-id> [--limit N]
+ark show <session-id>
+```
+
+`ark show` pretty-prints any session — cron, heartbeat, or conversational —
+collapsing turns and surfacing `RunError` rows + token-usage metrics inline.
+
+`sessions.cron_id` is populated only for sessions created by the scheduler
+firing that cron. Historical sessions (pre-migration) keep a null
+`cron_id` and won't surface in the new history endpoint.
+
 ## Heartbeat and cron sessions
 
 When a heartbeat fires or a cron expression matches, the scheduler creates
