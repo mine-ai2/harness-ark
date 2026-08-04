@@ -771,30 +771,59 @@ _register(
 
 
 def _list_skills() -> str:
-    from . import skills
+    from . import mcp, skills
 
-    manifest = skills.manifest()
-    if not manifest:
-        return "(no skills installed)"
     ctx = current_context()
-    loaded = ctx.agent.always_loaded_skills + sorted(ctx.loaded_skills)
-    lines = []
-    for name, desc in manifest:
+    always_loaded = set(ctx.agent.always_loaded_skills) | set(
+        ctx.agent.always_loaded_mcp_servers
+    )
+    loaded = always_loaded | ctx.loaded_skills
+
+    lines: list[str] = []
+    # Python skills first.
+    for name, desc in skills.manifest():
         marker = " [loaded]" if name in loaded else ""
         lines.append(f"{name}{marker} — {desc}")
+    # MCP servers this agent may access.
+    manager = mcp.get_manager()
+    for server_name in ctx.agent.mcp_servers:
+        srv = manager.get(server_name)
+        if srv is None:
+            lines.append(f"{server_name} (mcp) — not started")
+            continue
+        marker = " [loaded]" if server_name in loaded else ""
+        status = "" if srv.error is None else f" [unavailable: {srv.error}]"
+        desc = srv.description or f"{len(srv.tools)} tools"
+        lines.append(f"{server_name} (mcp){marker}{status} — {desc}")
+
+    if not lines:
+        return "(no skills installed)"
     return "\n".join(lines)
 
 
 def _load_skill(*, name: str) -> str:
-    from . import skills
+    """Load a Python skill *or* an MCP server (unified surface)."""
+    from . import mcp, skills
 
     ctx = current_context()
     skill = skills.get(name)
-    if skill is None:
-        raise ToolError(f"unknown skill: {name}")
-    ctx.loaded_skills.add(name)
-    tool_names = ", ".join(t.schema.name for t in skill.tools)
-    return f"loaded skill '{name}'. tools available: {tool_names or '(none)'}"
+    if skill is not None:
+        ctx.loaded_skills.add(name)
+        tool_names = ", ".join(t.schema.name for t in skill.tools)
+        return f"loaded skill '{name}'. tools available: {tool_names or '(none)'}"
+
+    # Try MCP.
+    if name in ctx.agent.mcp_servers:
+        srv = mcp.get_manager().get(name)
+        if srv is None:
+            raise ToolError(f"MCP server {name!r} is configured but not started")
+        if srv.error is not None:
+            raise ToolError(f"MCP server {name!r} is unavailable: {srv.error}")
+        ctx.loaded_skills.add(name)
+        tool_names = ", ".join(t.name for t in srv.tools)
+        return f"loaded MCP server '{name}'. tools available: {tool_names or '(none)'}"
+
+    raise ToolError(f"unknown skill: {name}")
 
 
 _register(
@@ -826,14 +855,29 @@ _register(
 
 
 def active_schemas(agent: "AgentConfig", loaded_skills: set[str]) -> list[ToolSchema]:
-    from . import skills
+    from . import mcp, skills
 
     schemas = [t.schema for t in BUILTINS.values()]
+
+    # Python skills — always-loaded + session-loaded.
     for skill_name in list(agent.always_loaded_skills) + sorted(loaded_skills):
         skill = skills.get(skill_name)
         if skill is None:
             continue
         schemas.extend(t.schema for t in skill.tools)
+
+    # MCP servers — always-loaded + session-loaded (session-loaded may include
+    # either Python skills OR MCP server names since load_skill unifies them).
+    manager = mcp.get_manager()
+    mcp_active = set(agent.always_loaded_mcp_servers) | (
+        loaded_skills & set(agent.mcp_servers)
+    )
+    for server_name in mcp_active:
+        srv = manager.get(server_name)
+        if srv is None or srv.error is not None:
+            continue
+        schemas.extend(srv.tools)
+
     # Deduplicate by name, preserving first occurrence.
     seen: set[str] = set()
     out: list[ToolSchema] = []
@@ -860,12 +904,58 @@ def _resolve(name: str, agent: "AgentConfig", loaded_skills: set[str]):
     return None, False
 
 
+def _resolve_mcp(
+    name: str, agent: "AgentConfig", loaded_skills: set[str]
+) -> tuple[str, str] | None:
+    """If `name` is an active MCP-backed tool for this agent, return
+    (server_name, raw_tool_name). Otherwise None."""
+    from . import mcp
+
+    if NAMESPACE_SEP not in name:
+        return None
+    server_name, _ = name.split(NAMESPACE_SEP, 1)
+    if server_name not in agent.mcp_servers:
+        return None
+    active = set(agent.always_loaded_mcp_servers) | (
+        loaded_skills & set(agent.mcp_servers)
+    )
+    if server_name not in active:
+        return None
+    srv = mcp.get_manager().get(server_name)
+    if srv is None or srv.error is not None:
+        return None
+    raw = srv.raw_tool_names.get(name)
+    if raw is None:
+        return None
+    return server_name, raw
+
+
+NAMESPACE_SEP = "__"
+
+
 def schemas() -> list[ToolSchema]:
     """Backwards-compatible: schemas of the built-ins only."""
     return [t.schema for t in BUILTINS.values()]
 
 
 async def execute(name: str, args: dict[str, Any], *, ctx: ToolContext) -> tuple[str, bool]:
+    # MCP-backed tools take a different path — no cwd change, no contextvar
+    # (external process; no notion of Ark's current session).
+    mcp_target = _resolve_mcp(name, ctx.agent, ctx.loaded_skills)
+    if mcp_target is not None:
+        from . import mcp as mcp_module
+
+        server_name, raw_name = mcp_target
+        cfg = ctx.config.mcp_servers.get(server_name)
+        timeout = cfg.timeout_seconds if cfg is not None else 30.0
+        try:
+            output = await mcp_module.get_manager().call_tool(
+                server_name, raw_name, args, timeout=timeout
+            )
+            return output, False
+        except mcp_module.MCPError as e:
+            return str(e), True
+
     fn, is_async = _resolve(name, ctx.agent, ctx.loaded_skills)
     if fn is None:
         return f"unknown tool: {name}", True

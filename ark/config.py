@@ -32,6 +32,21 @@ class ProviderConfig:
 
 
 @dataclass
+class MCPServerConfig:
+    name: str
+    transport: str  # "stdio" | "http"
+    # stdio
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    # http
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    # Applied per tool call (list_tools uses the same deadline).
+    timeout_seconds: float = 30.0
+
+
+@dataclass
 class AgentConfig:
     name: str
     provider: str  # references a key in Config.providers
@@ -41,6 +56,13 @@ class AgentConfig:
     # Override for the model's input-token ceiling. Optional — falls back to
     # the table in ark.models. Used purely to compute the usage indicator.
     max_context_tokens: int | None = None
+    # MCP servers this agent may access. Names reference Config.mcp_servers.
+    # Servers not listed here are invisible to the agent even if configured
+    # globally.
+    mcp_servers: list[str] = field(default_factory=list)
+    # Subset of mcp_servers whose tools are exposed on every turn without
+    # requiring the agent to call load_skill first. Mirrors always_loaded_skills.
+    always_loaded_mcp_servers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -49,6 +71,7 @@ class Config:
     providers: dict[str, ProviderConfig]
     tools: dict[str, dict[str, Any]]
     agents: dict[str, AgentConfig]
+    mcp_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
 
 
 def load(path: Path | None = None) -> Config:
@@ -66,8 +89,70 @@ def _from_dict(raw: dict[str, Any]) -> Config:
     server = _server(raw.get("server") or {})
     providers = _providers(raw.get("providers") or {})
     tools = dict(raw.get("tools") or {})
-    agents = _agents(raw.get("agents") or {}, providers)
-    return Config(server=server, providers=providers, tools=tools, agents=agents)
+    mcp_servers = _mcp_servers(raw.get("mcp_servers") or {})
+    agents = _agents(raw.get("agents") or {}, providers, mcp_servers)
+    return Config(
+        server=server,
+        providers=providers,
+        tools=tools,
+        agents=agents,
+        mcp_servers=mcp_servers,
+    )
+
+
+def _mcp_servers(raw: dict[str, Any]) -> dict[str, MCPServerConfig]:
+    out: dict[str, MCPServerConfig] = {}
+    for name, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            raise ConfigError(f"mcp_servers.{name} must be an object")
+        transport = cfg.get("transport")
+        if transport not in ("stdio", "http"):
+            raise ConfigError(
+                f"mcp_servers.{name}.transport must be 'stdio' or 'http'"
+            )
+        if transport == "stdio":
+            if not cfg.get("command"):
+                raise ConfigError(f"mcp_servers.{name}.command is required for stdio")
+            args = cfg.get("args") or []
+            if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                raise ConfigError(
+                    f"mcp_servers.{name}.args must be a list of strings"
+                )
+            env = cfg.get("env") or {}
+            if not isinstance(env, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+            ):
+                raise ConfigError(
+                    f"mcp_servers.{name}.env must be an object of string→string"
+                )
+        else:  # http
+            if not cfg.get("url"):
+                raise ConfigError(f"mcp_servers.{name}.url is required for http")
+            args = []
+            env = {}
+        headers = cfg.get("headers") or {}
+        if not isinstance(headers, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
+        ):
+            raise ConfigError(
+                f"mcp_servers.{name}.headers must be an object of string→string"
+            )
+        timeout = cfg.get("timeout_seconds", 30.0)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ConfigError(
+                f"mcp_servers.{name}.timeout_seconds must be a positive number"
+            )
+        out[name] = MCPServerConfig(
+            name=name,
+            transport=transport,
+            command=cfg.get("command"),
+            args=list(args),
+            env=dict(env),
+            url=cfg.get("url"),
+            headers=dict(headers),
+            timeout_seconds=float(timeout),
+        )
+    return out
 
 
 def _server(raw: dict[str, Any]) -> ServerConfig:
@@ -106,7 +191,9 @@ def _providers(raw: dict[str, Any]) -> dict[str, ProviderConfig]:
 
 
 def _agents(
-    raw: dict[str, Any], providers: dict[str, ProviderConfig]
+    raw: dict[str, Any],
+    providers: dict[str, ProviderConfig],
+    mcp_servers: dict[str, MCPServerConfig],
 ) -> dict[str, AgentConfig]:
     out: dict[str, AgentConfig] = {}
     for name, cfg in raw.items():
@@ -135,6 +222,31 @@ def _agents(
             raise ConfigError(
                 f"agents.{name}.max_context_tokens must be a positive integer if set"
             )
+        agent_mcp = cfg.get("mcp_servers") or []
+        if not isinstance(agent_mcp, list) or not all(
+            isinstance(s, str) for s in agent_mcp
+        ):
+            raise ConfigError(
+                f"agents.{name}.mcp_servers must be a list of strings"
+            )
+        for s in agent_mcp:
+            if s not in mcp_servers:
+                raise ConfigError(
+                    f"agents.{name}.mcp_servers references unknown server '{s}'"
+                )
+        always_mcp = cfg.get("always_loaded_mcp_servers") or []
+        if not isinstance(always_mcp, list) or not all(
+            isinstance(s, str) for s in always_mcp
+        ):
+            raise ConfigError(
+                f"agents.{name}.always_loaded_mcp_servers must be a list of strings"
+            )
+        for s in always_mcp:
+            if s not in agent_mcp:
+                raise ConfigError(
+                    f"agents.{name}.always_loaded_mcp_servers references '{s}' "
+                    f"which is not in agents.{name}.mcp_servers"
+                )
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -142,5 +254,7 @@ def _agents(
             workspace=workspace,
             always_loaded_skills=list(skills),
             max_context_tokens=max_ctx,
+            mcp_servers=list(agent_mcp),
+            always_loaded_mcp_servers=list(always_mcp),
         )
     return out

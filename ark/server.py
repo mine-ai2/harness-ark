@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import broker, db, file_watcher, projects, runtime, skills, workspace as ws
+from . import broker, db, file_watcher, mcp, projects, runtime, skills, workspace as ws
 from .config import Config
 from .scheduler import Scheduler
 from .types import AssistantText, UploadMessage, message_from_row
@@ -38,9 +38,14 @@ def create_app(config: Config) -> FastAPI:
         for agent in config.agents.values():
             agent.workspace.mkdir(parents=True, exist_ok=True)
             watcher.watch("workspace", agent.name, str(agent.workspace))
+        # Connect to configured MCP servers. Per-server failures don't abort
+        # startup — the manager records them and affected tools error at call.
+        mcp_manager = mcp.get_manager()
+        await mcp_manager.start(config.mcp_servers)
         try:
             yield
         finally:
+            await mcp_manager.stop()
             await watcher.stop()
             await sched.stop()
 
@@ -86,6 +91,19 @@ def create_app(config: Config) -> FastAPI:
             "SELECT id, expr, prompt FROM crons WHERE agent_name = ? AND enabled = 1",
             (name,),
         ).fetchall()
+        mcp_manager = mcp.get_manager()
+        mcp_status = []
+        for server_name in agent.mcp_servers:
+            srv = mcp_manager.get(server_name)
+            mcp_status.append(
+                {
+                    "name": server_name,
+                    "ready": srv is not None and srv.error is None,
+                    "error": srv.error if srv is not None else "not started",
+                    "tool_count": len(srv.tools) if srv is not None else 0,
+                    "always_loaded": server_name in agent.always_loaded_mcp_servers,
+                }
+            )
         return {
             "name": agent.name,
             "provider": agent.provider,
@@ -93,6 +111,7 @@ def create_app(config: Config) -> FastAPI:
             "model": agent.model,
             "workspace": str(agent.workspace),
             "always_loaded_skills": agent.always_loaded_skills,
+            "mcp_servers": mcp_status,
             "heartbeat_seconds": heartbeat["heartbeat_seconds"] if heartbeat else None,
             "crons": [dict(r) for r in crons],
         }

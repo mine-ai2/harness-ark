@@ -13,10 +13,11 @@ file — they live in the database and are managed at runtime (see
 
 ```json
 {
-  "server":    { ... },
-  "providers": { "<name>": { ... }, ... },
-  "tools":     { "<name>": { ... }, ... },
-  "agents":    { "<name>": { ... }, ... }
+  "server":       { ... },
+  "providers":    { "<name>": { ... }, ... },
+  "tools":        { "<name>": { ... }, ... },
+  "mcp_servers":  { "<name>": { ... }, ... },
+  "agents":       { "<name>": { ... }, ... }
 }
 ```
 
@@ -25,6 +26,7 @@ file — they live in the database and are managed at runtime (see
 | `server` | yes | HTTP/WS listener and the bearer token |
 | `providers` | yes | LLM provider credentials (Anthropic, OpenAI) |
 | `tools` | no | Per-tool config (API keys for external services like search) |
+| `mcp_servers` | no | External MCP servers exposing tool bundles (see [mcp.md](mcp.md)) |
 | `agents` | yes | The agents the server hosts |
 
 Validation is strict: missing required fields raise `ConfigError` at startup
@@ -251,6 +253,8 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `workspace` | string | no | Absolute path the agent treats as its working directory. Defaults to `<ARK_HOME>/agents/<name>/workspace`. `~` is expanded. |
 | `always_loaded_skills` | string[] | no | Names of skills whose tool schemas are exposed on every session start. Skills not in this list are still discoverable via `list_skills()` / `load_skill()`. |
 | `max_context_tokens` | int | no | Override the model's input-token ceiling for the usage indicator. Falls back to the table in [ark/models.py](../ark/models.py). Set when you want to override the default (e.g. opt into Anthropic's 1M-token beta — `1000000`) or when the model isn't in the table. |
+| `mcp_servers` | string[] | no | Names of MCP servers this agent may access. Every name must appear in top-level `mcp_servers`. Servers not listed here are invisible to the agent — a per-agent access whitelist. See [mcp.md](mcp.md). |
+| `always_loaded_mcp_servers` | string[] | no | Subset of `mcp_servers` whose tools are exposed on every turn without requiring the agent to call `load_skill` first. Mirrors `always_loaded_skills` for MCP-backed tools. |
 
 Two files live alongside each agent's config — Ark creates them on
 `init` / `serve` if missing, and you edit them as part of agent design:

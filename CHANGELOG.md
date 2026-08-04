@@ -1,5 +1,79 @@
 # Changelog
 
+## Unreleased — MCP servers as first-class tool sources
+
+Ark speaks [Model Context Protocol](https://modelcontextprotocol.io) as a
+client. Configured MCP servers appear to agents alongside Python skills,
+same discovery + loading affordances. See [docs/mcp.md](docs/mcp.md) for
+the full reference.
+
+### New config
+
+Two additive blocks, both optional:
+
+```json
+"mcp_servers": {
+  "linear":   { "transport": "stdio", "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-linear"],
+                "env": { "LINEAR_API_KEY": "lin_..." } },
+  "notion":   { "transport": "http", "url": "https://mcp.notion.com/mcp",
+                "headers": { "Authorization": "Bearer nti_..." } }
+},
+"agents": {
+  "scribe": {
+    ...
+    "mcp_servers": ["linear", "notion"],           // per-agent whitelist
+    "always_loaded_mcp_servers": ["linear"]        // schemas exposed every turn
+  }
+}
+```
+
+Existing configs continue to work unchanged.
+
+### Tool namespace
+
+MCP tool names are prefixed with the server name: `linear__create_issue`,
+`postgres__query`. Double-underscore separator so no provider's
+tool-schema validator objects.
+
+### Unified with skills
+
+`list_skills` shows both Python skills and MCP servers (tagged `(mcp)`),
+and `load_skill("linear")` works uniformly — the distinction is invisible
+from the agent's perspective. The only difference is the tool-name
+prefix.
+
+### Lifecycle
+
+Persistent connections opened at server boot and reused across all
+sessions. Per-server startup failures don't abort Ark — the server is
+marked unavailable, its tools return errors when called. Connections
+close cleanly on shutdown.
+
+`GET /agents/{name}` now includes per-agent MCP server status
+(`ready`/`error`/`tool_count`/`always_loaded`) so clients can render an
+"MCP health" panel.
+
+### Sharp edges
+
+- **stdio servers are uvicorn subprocesses**. Clean shutdown via
+  `systemctl restart`; `kill -9` may leave zombies.
+- **MCP tools have no context**. No `current_context()`, no DB, no
+  workspace. Right boundary for external integrations.
+- **Token bloat if abused**. Always-loading multiple 50-tool servers is
+  real cost. Prefer lazy `load_skill` unless the agent uses those tools
+  every turn.
+- **No per-tool ACL yet**. You can gate at the server level, not per
+  tool. Comes later.
+
+### Dependency
+
+Adds `mcp>=1.0` (official Python SDK). Requires Python 3.10+; the
+production container is on 3.11 and the dev container on 3.12, so this is
+fine. The local dev venv on macOS Python 3.9 keeps working — the SDK
+import in `ark/mcp.py` is lazy and gated on config, and MCP-specific
+tests use a stub connection factory.
+
 ## Unreleased — Cron fire history + session metadata + ark show
 
 For debugging "what did this cron actually do," the scheduler now records
