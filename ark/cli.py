@@ -233,6 +233,22 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             ui.error_line(f"[auth failure — check your provider API key. {msg[:120]}]")
         else:
             ui.error_line(f"[server error: {msg}]")
+    elif t == "compaction_started":
+        reason = evt.get("reason") or ""
+        it = evt.get("input_tokens")
+        cw = evt.get("context_window")
+        pct = f" ({100 * it / cw:.0f}% full)" if it and cw else ""
+        ui.status(f"compacting session{pct}")
+        ui.error_line(f"[compaction started · reason={reason}]")
+    elif t == "compaction_completed":
+        summary = evt.get("summary") or ""
+        ui.error_line(f"[compaction completed · summary {len(summary)} chars]")
+    elif t == "compaction_failed":
+        ui.error_line(
+            f"[compaction failed: {evt.get('code','?')} — {(evt.get('message') or '')[:120]}]"
+        )
+    elif t == "compaction_skipped":
+        ui.error_line(f"[compaction skipped: {evt.get('reason','')}]")
     elif t == "done":
         ui.done()
 
@@ -399,6 +415,42 @@ async def _chat(
                             )
                         except Exception as e:  # noqa: BLE001
                             print(f"[/context failed: {e}]", file=sys.stderr)
+                        continue
+                    if text == "/compact" or text.startswith("/compact "):
+                        # `/compact` → server-generated summary
+                        # `/compact set: <text>` → client-supplied summary
+                        rest = text[len("/compact"):].strip()
+                        payload: dict = {}
+                        if rest.startswith("set:"):
+                            supplied = rest[len("set:"):].strip()
+                            if not supplied:
+                                print("[/compact set: empty, ignored]", file=sys.stderr)
+                                continue
+                            payload = {"summary": supplied}
+                        elif rest:
+                            print(
+                                "[/compact: unrecognized form. Use `/compact` or "
+                                "`/compact set: <your summary text>`]",
+                                file=sys.stderr,
+                            )
+                            continue
+                        try:
+                            # Lifecycle events land on the WS naturally — the
+                            # UI prints them via _handle_event. This just needs
+                            # to be a fire-and-await (long timeout because the
+                            # summarizer call is a full provider round-trip).
+                            cr = await http.post(
+                                f"/agents/{agent}/sessions/{session_id}/compact",
+                                json=payload,
+                                timeout=300,
+                            )
+                            if cr.status_code >= 400:
+                                print(
+                                    f"[/compact failed: {cr.status_code} {cr.text[:200]}]",
+                                    file=sys.stderr,
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[/compact failed: {e}]", file=sys.stderr)
                         continue
                     turn_done.clear()
                     ui.status("thinking")

@@ -48,7 +48,8 @@ GET /agents/{name}/sessions/{sid}/history
 
 Returns every message in the session, ordered chronologically. `kind` is the
 class name of the message (`UserText`, `AssistantText`, `ToolCall`,
-`ToolResult`, `UploadMessage`, `SharedFile`, `SessionContext`).
+`ToolResult`, `UploadMessage`, `SharedFile`, `SessionContext`,
+`CompactionSummary`).
 
 ### Delete a session
 
@@ -165,6 +166,10 @@ right session.
 | `file_available` | `path`, `description`, `size` | Agent shared a file (see [files.md](files.md)) |
 | `injected_message` | `from_session_id`, `text` | Another session injected a message via `post_to_session` |
 | `error` | `code`, `message` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
+| `compaction_started` | `reason`, `input_tokens`, `context_window`, `model` | Compaction is about to run (see [Compaction](#compaction)) |
+| `compaction_completed` | `summary`, `reason` | Summary persisted; subsequent turns use it |
+| `compaction_failed` | `code`, `message`, `reason` | Summarizer call errored |
+| `compaction_skipped` | `reason`, `input_tokens`, `context_window` | Threshold crossed but compaction is disabled — warning-only, no action taken |
 | `done` | `stop_reason` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
 
 Every event also carries `session_id` and (except for the broad "error" case
@@ -259,11 +264,14 @@ You can override per-agent in config:
 If neither the table nor a config override has a value, `context_window`
 is `null` in the event and the CLI shows raw counts only.
 
-**No compaction in v1.** When a session's accumulated input would exceed
-the model's window, the provider returns an error, the runtime classifies
-it as `context_too_long` and records it as a `RunError` in history. The
-CLI surfaces this with an actionable message. Recovery is "start a new
-session." Compaction / summarization is a separate piece of work.
+**Automatic compaction.** When a session's fill approaches the model's
+window, Ark summarizes prior conversation into a `CompactionSummary`
+message and folds that summary into the system prompt from that point
+forward, hiding the older turns from the LLM (but keeping them in
+history for audit and client rendering). See [Compaction](#compaction)
+below. If compaction is disabled or its summarizer call fails, the
+underlying `context_too_long` error surfaces as before and the recovery
+recipe (start a new session) still applies.
 
 ## Error tracking
 
@@ -282,6 +290,136 @@ After an error, the run loop ends with `stop_reason: "error:<code>"`. The
 session is not deleted — history is fully readable and you can attempt
 another turn (which will likely hit the same problem until you act on the
 code).
+
+## Compaction
+
+When a session grows large, Ark automatically summarizes prior turns into a
+`CompactionSummary` message and folds that summary into the system prompt.
+Subsequent turns see:
+
+```
+<agent persona / environment / session context / project framing>
++ "Prior conversation (summarized): <summary text>"
++ conversation turns since the compaction
+```
+
+The pre-compaction turns stay in history — `GET /history` returns them and
+clients can render them as a collapsed-by-default region below the summary
+divider. But the LLM sees only the summary + fresh turns. Every compaction
+is one durable message row; multiple compactions accumulate as an audit
+trail of what got dropped and when.
+
+### Triggers
+
+| Trigger | When | `reason` value |
+|---|---|---|
+| **Proactive** | At turn start, if last observed `TurnMetrics.input_tokens` ≥ `compaction_threshold × context_window` | `auto:threshold(<tokens>/<window>)` |
+| **Reactive** | On `context_too_long` at the first iteration of a turn (retries the same turn once with the compacted history) | `reactive:context_too_long` |
+| **Client-invoked (server-generated)** | `POST /agents/{name}/sessions/{sid}/compact` with empty body — server runs the summarizer | `client-invoked` |
+| **Client-invoked (client-supplied)** | Same endpoint with `{"summary": "..."}` — text is used verbatim, no LLM call | `client-supplied` |
+
+Reactive only runs at the start of a turn — mid-tool-loop failures fall
+through to the normal error path (compacting across an unmatched
+`ToolCall`/`ToolResult` boundary would confuse the retry).
+
+Compaction attempts at most once per turn. If reactive compaction succeeds
+but the retry itself hits `context_too_long` again, the session fails with
+`error:context_too_long` (existing recovery: start a new session).
+
+### Config
+
+Per-agent, both optional (defaults shown):
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "compaction_enabled": true,
+    "compaction_threshold": 0.85
+  }
+}
+```
+
+Threshold is a fraction strictly between 0 and 1. Setting
+`compaction_enabled: false` keeps the old "just fail with `context_too_long`"
+behavior for the automatic triggers; when the threshold would trigger under
+that setting, a `compaction_skipped` event fires so clients can warn the
+user. **The manual endpoint (`POST .../compact`) runs regardless of this
+flag** — the client is explicitly asking.
+
+### Manual compaction
+
+```
+POST /agents/{name}/sessions/{sid}/compact
+Body: {}                            # server generates the summary
+      { "summary": "..." }          # supplied text, no LLM call
+Response (200): { "ok": true, "summary": "<text>", "reason": "client-invoked" | "client-supplied" }
+Response (502): { "ok": false, "code": "<classified>", "message": "..." }
+                — summarizer call failed; no CompactionSummary row was written
+```
+
+Guards:
+
+- `404` if the agent or session doesn't exist.
+- `409` if the session is mid-tool-loop (any `ToolCall` without a matching
+  `ToolResult`) — compacting across that boundary would leave the retry
+  seeing a `ToolResult` referencing a call id it can no longer see.
+- `400` if a `summary` field is provided but empty or non-string.
+
+Fires the same lifecycle events on `/events` as automatic compactions, so
+any connected WS client sees the work happening.
+
+CLI slash command mid-chat:
+
+```
+you> /compact                             # server-generated
+you> /compact set: <your summary text>    # supplied
+```
+
+### Events
+
+Every compaction attempt emits a lifecycle event pair on `/events`:
+
+| Event | Fields | When |
+|---|---|---|
+| `compaction_started` | `reason`, `input_tokens`, `context_window`, `model` | About to run the summarizer |
+| `compaction_completed` | `summary`, `reason` | Summary persisted; subsequent turns will use it |
+| `compaction_failed` | `code`, `message`, `reason` | Summarizer call errored — the turn either continues uncompacted (proactive) or falls to `context_too_long` (reactive) |
+| `compaction_skipped` | `reason`, `input_tokens`, `context_window` | Threshold crossed but `compaction_enabled: false` — a warning signal, no action taken |
+
+Clients can render "Compacting session… (context was 87% full)" between
+`compaction_started` and `compaction_completed`, and show the resulting
+summary alongside the visual divider in the transcript.
+
+### What the summarizer preserves
+
+The default summarizer prompt asks the model (the session's own model —
+same provider, same context) to preserve names, facts, decisions, files
+referenced by path, code discussed or written, commitments made to the
+user, open questions, and significant tool results. It's told to omit
+persona/environment (those are provided separately) and to be complete
+over concise.
+
+If a prior `CompactionSummary` exists, its text is passed to the new
+summarizer as background so information isn't lost across successive
+compactions.
+
+### Sharp edges
+
+- **The summarizer's judgment is load-bearing.** A bad summary drops
+  something the user cared about. Older summaries stay in history as an
+  audit trail; a future "restore" flow could rewind past them.
+- **Cost.** One extra provider call per compaction, using the session's
+  own model. Later versions may allow a cheaper `compaction_model`
+  override.
+- **Guard floors.** Compaction skips when fewer than 6 messages have
+  accumulated since the last summary — no point summarizing a handful of
+  turns.
+- **First turn.** With no `TurnMetrics` observed yet, the proactive check
+  has no denominator; it skips.
+- **Post-compaction fill unknown.** Immediately after a compaction, the
+  last `TurnMetrics` still shows the pre-compaction count. The proactive
+  check detects this and skips until the next turn's fresh metrics land.
 
 ## Cross-session messaging
 

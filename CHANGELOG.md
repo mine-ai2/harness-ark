@@ -1,5 +1,154 @@
 # Changelog
 
+## Unreleased — Manual session compaction
+
+Client-invoked companion to automatic compaction. Same underlying mechanism
+and events; new REST + CLI surface for on-demand triggering.
+
+### New REST endpoint
+
+```
+POST /agents/{name}/sessions/{sid}/compact
+Body: {}                        # server-generated summary
+      { "summary": "..." }      # client-supplied text, no LLM call
+
+200: { "ok": true, "summary": "<text>", "reason": "client-invoked" | "client-supplied" }
+502: { "ok": false, "code": "<classified>", "message": "..." }
+```
+
+- `404` for unknown agent or session.
+- `409` if the session is mid-tool-loop (any `ToolCall` without a matching
+  `ToolResult`) — same sharp-edge as the reactive trigger; compacting
+  across that boundary would orphan a `ToolResult`.
+- `400` if `summary` is provided but empty or non-string.
+- Fires `compaction_started` → `compaction_completed`/`_failed` on
+  `/events` so connected WS clients see the work.
+- **Ignores `compaction_enabled`** on the agent — that flag only gates
+  the automatic triggers; explicit client requests always run.
+
+### New CLI slash command
+
+Mid-chat:
+
+```
+you> /compact                                # server-generated
+you> /compact set: <your summary text>       # supplied
+```
+
+### Client rendering
+
+`_handle_event` in the CLI now renders the four compaction event types
+(`compaction_started`, `_completed`, `_failed`, `_skipped`) with a
+"Compacting session (N% full)" status line and a summary-length ack. All
+three trigger paths (proactive/reactive/client-invoked) surface
+identically to any client subscribed to `/events`.
+
+## Unreleased — Automatic session compaction
+
+Sessions that approach the model's context window are now automatically
+summarized. Prior turns get folded into a `CompactionSummary` message
+(persisted, visible in history), and subsequent turns see only the
+summary + post-compaction turns. See
+[docs/sessions.md § Compaction](docs/sessions.md#compaction) for the
+reference.
+
+### Mechanism
+
+One new message type — `CompactionSummary(text, reason)` — persisted like
+any other. Runtime rule: when building the LLM's message list, if any
+`CompactionSummary` exists, take only messages after the LATEST one; fold
+its text into the system prompt as a "Prior conversation (summarized)"
+stanza. Older messages stay in history for audit/replay, invisible to
+the LLM. No DB schema migration — `messages.content_json` handles the
+new kind natively.
+
+### Triggers
+
+Two triggers, both automatic:
+
+- **Proactive**: at turn start, if last observed
+  `TurnMetrics.input_tokens ≥ compaction_threshold × context_window`,
+  compact before persisting the incoming user message. The user message
+  becomes the first post-compaction turn.
+- **Reactive**: on `context_too_long` at the first iteration of a turn,
+  compact and retry the same turn once. Reactive only runs at turn start
+  (last message is `UserText`) — mid-tool-loop failures fall through to
+  the existing error path.
+
+Compaction attempts at most once per turn. Reactive after successful
+proactive is not attempted.
+
+### Config
+
+Per-agent, both optional (defaults `true` / `0.85`):
+
+```json
+"agents": {
+  "scribe": {
+    ...
+    "compaction_enabled": true,
+    "compaction_threshold": 0.85
+  }
+}
+```
+
+Existing configs pick up the defaults without change.
+
+### New events on `/events`
+
+Four events for full client traceability of compaction work:
+
+| Event | When |
+|---|---|
+| `compaction_started` | About to run the summarizer (`reason`, `input_tokens`, `context_window`, `model`) |
+| `compaction_completed` | Summary persisted (`summary`, `reason`) |
+| `compaction_failed` | Summarizer errored (`code`, `message`, `reason`) — turn proceeds/falls through per trigger type |
+| `compaction_skipped` | Threshold crossed but `compaction_enabled: false` — warning-only |
+
+Client UX: render "Compacting session… (context was 87% full)" between
+`_started` and `_completed`, and show the resulting summary alongside a
+visual divider in the transcript. Everything before the divider can be
+rendered collapsed-by-default so the user can still scroll back.
+
+### Summarizer
+
+Uses the session's own provider + model. Prompt asks the model to preserve
+names, facts, decisions, files (by path), code discussed or written,
+commitments, open questions, and significant tool results. Omits
+persona/environment (provided separately). If a prior `CompactionSummary`
+exists, its text is passed as background so information isn't lost across
+successive compactions.
+
+### Sharp edges
+
+- **Once per turn.** No infinite compact-retry loops.
+- **6-message floor** since the last compaction — no point summarizing a
+  handful of turns.
+- **Post-compaction fill is unknown** until the next turn's `TurnMetrics`
+  lands; proactive check detects this via a "metrics predate latest
+  compaction" guard and skips.
+- **Reactive is idle-only** — mid-tool-loop context overflow still fails
+  fast rather than compacting across an unmatched `ToolCall`/`ToolResult`
+  boundary.
+- **Summarizer quality is load-bearing**; old summaries persist in
+  history as an audit trail. Restore-from-prior-summary is a natural
+  future addition but not shipped in this cut.
+- **Cost**: one extra provider call per compaction. Model override for
+  the summarizer (cheap tier) is a natural future config knob.
+
+### Client migration
+
+Additive — existing clients continue to work. To surface the feature:
+
+1. Handle the four new event types (`compaction_started`,
+   `_completed`, `_failed`, `_skipped`). At minimum, show a spinner while
+   between started and completed.
+2. Handle `CompactionSummary` in `GET /history` — render as a divider
+   with the summary body expandable, and consider collapsing everything
+   older.
+3. Nothing else changes — the underlying turn/error/tool events stream
+   identically.
+
 ## Unreleased — MCP servers as first-class tool sources
 
 Ark speaks [Model Context Protocol](https://modelcontextprotocol.io) as a

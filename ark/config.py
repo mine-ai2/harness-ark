@@ -63,6 +63,9 @@ class AgentConfig:
     # Subset of mcp_servers whose tools are exposed on every turn without
     # requiring the agent to call load_skill first. Mirrors always_loaded_skills.
     always_loaded_mcp_servers: list[str] = field(default_factory=list)
+    # Automatic session compaction — see docs/sessions.md.
+    compaction_enabled: bool = True
+    compaction_threshold: float = 0.85  # fraction of context_window that triggers
 
 
 @dataclass
@@ -247,6 +250,19 @@ def _agents(
                     f"agents.{name}.always_loaded_mcp_servers references '{s}' "
                     f"which is not in agents.{name}.mcp_servers"
                 )
+        compaction_enabled = cfg.get("compaction_enabled", True)
+        if not isinstance(compaction_enabled, bool):
+            raise ConfigError(
+                f"agents.{name}.compaction_enabled must be a boolean"
+            )
+        compaction_threshold = cfg.get("compaction_threshold", 0.85)
+        if (
+            not isinstance(compaction_threshold, (int, float))
+            or not (0.0 < compaction_threshold < 1.0)
+        ):
+            raise ConfigError(
+                f"agents.{name}.compaction_threshold must be a number strictly between 0 and 1"
+            )
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -256,5 +272,7 @@ def _agents(
             max_context_tokens=max_ctx,
             mcp_servers=list(agent_mcp),
             always_loaded_mcp_servers=list(always_mcp),
+            compaction_enabled=compaction_enabled,
+            compaction_threshold=float(compaction_threshold),
         )
     return out

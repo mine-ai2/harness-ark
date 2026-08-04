@@ -255,6 +255,8 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `max_context_tokens` | int | no | Override the model's input-token ceiling for the usage indicator. Falls back to the table in [ark/models.py](../ark/models.py). Set when you want to override the default (e.g. opt into Anthropic's 1M-token beta — `1000000`) or when the model isn't in the table. |
 | `mcp_servers` | string[] | no | Names of MCP servers this agent may access. Every name must appear in top-level `mcp_servers`. Servers not listed here are invisible to the agent — a per-agent access whitelist. See [mcp.md](mcp.md). |
 | `always_loaded_mcp_servers` | string[] | no | Subset of `mcp_servers` whose tools are exposed on every turn without requiring the agent to call `load_skill` first. Mirrors `always_loaded_skills` for MCP-backed tools. |
+| `compaction_enabled` | bool | no | Turn automatic session compaction on/off. Default `true`. See [sessions.md § Compaction](sessions.md#compaction). |
+| `compaction_threshold` | number | no | Fraction of `context_window` (strictly between 0 and 1) that triggers proactive compaction. Default `0.85`. |
 
 Two files live alongside each agent's config — Ark creates them on
 `init` / `serve` if missing, and you edit them as part of agent design:

@@ -16,6 +16,11 @@ from .provider import AnthropicProvider, Provider
 from .types import (
     AssistantText,
     AssistantTurnEnd,
+    CompactionCompletedEvent,
+    CompactionFailedEvent,
+    CompactionSkippedEvent,
+    CompactionStartedEvent,
+    CompactionSummary,
     Message,
     Project,
     RunEnd,
@@ -176,6 +181,7 @@ def system_prompt(
     agent: AgentConfig,
     contexts: list[SessionContext] | None = None,
     project: Project | None = None,
+    compaction_summary: str | None = None,
 ) -> str:
     """Build the system prompt.
 
@@ -185,6 +191,7 @@ def system_prompt(
          file/shell/upload helpers)
       3. Project framing — only when this session is bound to a project
       4. Any client-supplied SessionContext messages, concatenated in order
+      5. Prior-conversation summary — only after a compaction has occurred
     """
 
     ctx_path = paths.agent_dir(agent.name) / "session_context.md"
@@ -239,6 +246,16 @@ def system_prompt(
                 + joined
                 + "\n"
             )
+    if compaction_summary and compaction_summary.strip():
+        out += (
+            "\n\n---\n"
+            "Prior conversation (summarized — this is your memory of everything "
+            "that happened in this session before the messages that follow. Treat "
+            "it as authoritative; the underlying turns have been dropped from "
+            "your active context):\n"
+            + compaction_summary.strip()
+            + "\n"
+        )
     return out
 
 
@@ -290,6 +307,204 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+
+_SUMMARIZER_SYSTEM_PROMPT = """You are producing a summary of a prior conversation to preserve context that will be dropped from the model's active memory.
+
+Include:
+- Names, facts, and decisions from the conversation.
+- Files referenced by path (created, modified, uploaded, shared).
+- Code snippets discussed or written — paraphrase the logic; preserve file paths and function names.
+- Commitments the assistant made to the user.
+- Open questions and next steps.
+- Any tool use that produced significant results.
+
+Omit:
+- Persona instructions or environment facts (those are provided separately).
+- Small talk or greetings.
+- Verbatim repetition of long tool outputs — summarize their essence.
+
+Be complete over concise. The assistant will rely on this summary as its only memory of what happened before, so err toward including detail. Do not preface with "Here is a summary" — just write the summary."""
+
+
+# LLM-invisible message kinds. Persisted in history for audit/replay/telemetry,
+# but stripped before the message list is sent to the provider. Compaction
+# summaries are excluded because their text is folded into the system prompt
+# via the compaction slice logic instead.
+_LLM_EXCLUDED = (SessionContext, TurnMetrics, RunError, CompactionSummary)
+
+
+def _latest_compaction(history: list[Message]) -> tuple[int, CompactionSummary] | None:
+    """Return (index, msg) of the latest CompactionSummary in history, or None."""
+    for i in range(len(history) - 1, -1, -1):
+        if isinstance(history[i], CompactionSummary):
+            return i, history[i]
+    return None
+
+
+def has_pending_tool_calls(history: list[Message]) -> bool:
+    """True if any ToolCall in history has no matching ToolResult — i.e. the
+    session is mid-tool-loop. Compacting across this boundary would leave the
+    LLM with a ToolResult referencing an id it can no longer see. Used to
+    guard the manual compaction endpoint (proactive/reactive triggers already
+    happen at safe moments by construction)."""
+    seen_results: set[str] = set()
+    pending: set[str] = set()
+    for m in history:
+        if isinstance(m, ToolCall):
+            pending.add(m.id)
+        elif isinstance(m, ToolResult):
+            seen_results.add(m.call_id)
+    return bool(pending - seen_results)
+
+
+def _should_compact_proactive(
+    history: list[Message], threshold: float, context_window: int | None
+) -> tuple[bool, int | None]:
+    """Decide if we should proactively compact before the next turn.
+
+    Returns (should_compact, last_input_tokens). Uses the last observed
+    TurnMetrics as the fill gauge — a slight undercount since new messages
+    have arrived since, which is fine (the threshold sits below the true
+    ceiling anyway).
+
+    Skips when:
+    - context_window is unknown (no denominator)
+    - no TurnMetrics observed yet (first turn)
+    - latest TurnMetrics predates the latest CompactionSummary (stale — we
+      compacted since observing, so we don't know the current fill)
+    - fewer than 6 messages have accumulated since the last compaction
+      (compacting a tiny history is silly)
+    """
+    if context_window is None or context_window <= 0:
+        return False, None
+    last_metrics_idx: int | None = None
+    last_metrics: TurnMetrics | None = None
+    for i in range(len(history) - 1, -1, -1):
+        if isinstance(history[i], TurnMetrics):
+            last_metrics_idx, last_metrics = i, history[i]
+            break
+    if last_metrics is None:
+        return False, None
+    latest = _latest_compaction(history)
+    if latest is not None and last_metrics_idx is not None and last_metrics_idx < latest[0]:
+        return False, last_metrics.input_tokens
+    since_start = len(history) - (latest[0] + 1) if latest is not None else len(history)
+    if since_start < 6:
+        return False, last_metrics.input_tokens
+    fraction = last_metrics.input_tokens / context_window
+    if fraction < threshold:
+        return False, last_metrics.input_tokens
+    return True, last_metrics.input_tokens
+
+
+async def compact_session(
+    *,
+    conn: sqlite3.Connection,
+    config: Config,
+    agent: AgentConfig,
+    session_id: str,
+    reason: str,
+    exclude_last: int = 0,
+    provider_factory=None,
+) -> AsyncIterator[RuntimeEvent]:
+    """Summarize prior conversation and persist a CompactionSummary row.
+
+    Yields: CompactionStartedEvent, then either CompactionCompletedEvent
+    or CompactionFailedEvent.
+
+    `exclude_last` is the number of tail messages to hold out of the summary
+    input — used by the reactive path to exclude the just-appended user
+    message (which should show up in the retry, not in the summary).
+    """
+    context_window = models.context_window_for(agent.model, agent.max_context_tokens)
+    yield CompactionStartedEvent(
+        reason=reason, context_window=context_window, model=agent.model
+    )
+
+    history = load_history(conn, session_id)
+    latest = _latest_compaction(history)
+    prior_summary = latest[1].text if latest is not None else None
+    slice_idx = latest[0] + 1 if latest is not None else 0
+
+    # Post-slice content that will be summarized. Also strip LLM-invisible kinds
+    # so the summarizer doesn't waste tokens on telemetry rows.
+    to_summarize: list[Message] = [
+        m for m in history[slice_idx:] if not isinstance(m, _LLM_EXCLUDED)
+    ]
+    if exclude_last > 0:
+        to_summarize = to_summarize[:-exclude_last]
+
+    if not to_summarize:
+        yield CompactionFailedEvent(
+            code="other", message="nothing to summarize", reason=reason
+        )
+        return
+
+    system = _SUMMARIZER_SYSTEM_PROMPT
+    if prior_summary:
+        system += (
+            "\n\nPrior summary of context before the excerpt below "
+            "(preserve information from it in your new summary):\n"
+            + prior_summary
+        )
+
+    # Append a synthetic user turn asking for the summary. Without this,
+    # message lists that end with an AssistantText leave the model waiting
+    # for the "next" user turn — Gemini in particular returns empty text
+    # rather than treating the system prompt's instruction as the ask.
+    to_summarize = to_summarize + [
+        UserText(
+            text="Produce the summary now, as instructed in your system prompt."
+        )
+    ]
+
+    provider_cfg = config.providers[agent.provider]
+    # Resolve lazily so monkeypatching runtime.make_provider from tests works
+    # (the default-arg pattern would capture the original function at
+    # definition time).
+    factory = provider_factory or make_provider
+    provider = factory(
+        provider_cfg.provider_type,
+        api_key=provider_cfg.api_key,
+        base_url=provider_cfg.base_url,
+    )
+
+    summary_text = ""
+    try:
+        async for evt in provider.stream_turn(
+            model=agent.model,
+            system=system,
+            messages=to_summarize,
+            tools=[],
+        ):
+            if isinstance(evt, TextDelta):
+                summary_text += evt.text
+            # We intentionally do not forward the summarizer's own token
+            # metrics or turn-end events — they'd be confusing telemetry
+            # attributed to a "turn" that doesn't exist from the user's
+            # perspective.
+    except Exception as exc:  # noqa: BLE001
+        code, message = classify_provider_error(exc)
+        yield CompactionFailedEvent(code=code, message=message, reason=reason)
+        return
+
+    summary_text = summary_text.strip()
+    if not summary_text:
+        yield CompactionFailedEvent(
+            code="other", message="summarizer returned empty text", reason=reason
+        )
+        return
+
+    append_message(
+        conn, session_id, CompactionSummary(text=summary_text, reason=reason)
+    )
+    yield CompactionCompletedEvent(summary=summary_text, reason=reason)
+
+
+# ---------------------------------------------------------------------------
 # Turn loop
 # ---------------------------------------------------------------------------
 
@@ -306,6 +521,38 @@ async def run_user_turn(
 ) -> AsyncIterator[RuntimeEvent]:
     """Persist the user message, then drive the model → tools → model loop."""
 
+    context_window = models.context_window_for(
+        agent.model, agent.max_context_tokens
+    )
+
+    # Proactive compaction: check before persisting the user message so that
+    # message ends up as the FIRST post-compaction turn — cleaner semantics
+    # than "user message, intervening compaction, then a turn."
+    compaction_used = False
+    pre_history = load_history(conn, session_id)
+    should_compact, last_input_tokens = _should_compact_proactive(
+        pre_history, agent.compaction_threshold, context_window
+    )
+    if should_compact:
+        reason = f"auto:threshold({last_input_tokens}/{context_window})"
+        if agent.compaction_enabled:
+            success = False
+            async for evt in compact_session(
+                conn=conn, config=config, agent=agent, session_id=session_id,
+                reason=reason, provider_factory=provider_factory,
+            ):
+                yield evt
+                if isinstance(evt, CompactionCompletedEvent):
+                    success = True
+            if success:
+                compaction_used = True
+        else:
+            yield CompactionSkippedEvent(
+                reason=f"disabled:{reason}",
+                input_tokens=last_input_tokens,
+                context_window=context_window,
+            )
+
     append_message(conn, session_id, UserText(text=user_text))
 
     provider_cfg = config.providers[agent.provider]
@@ -315,21 +562,27 @@ async def run_user_turn(
         base_url=provider_cfg.base_url,
     )
     skills_for_session = loaded_skills(session_id)
-    context_window = models.context_window_for(
-        agent.model, agent.max_context_tokens
-    )
     project = session_project(conn, session_id)
 
     last_stop_reason: str | None = None
-    # Message kinds that exist as session-history metadata but must NOT be
-    # passed to the LLM as conversation turns (system_prompt material,
-    # telemetry, or recorded errors).
-    _llm_excluded = (SessionContext, TurnMetrics, RunError)
     for _ in range(max_iterations):
         history = load_history(conn, session_id)
+        # Slice for the LLM's message list at the latest CompactionSummary:
+        # everything before it has been summarized and folded into the system
+        # prompt below. SessionContext is timeless (persona-layer) and drawn
+        # from the FULL history, not the slice.
         contexts = [m for m in history if isinstance(m, SessionContext)]
-        turn_messages = [m for m in history if not isinstance(m, _llm_excluded)]
-        system = system_prompt(agent, contexts, project=project)
+        latest = _latest_compaction(history)
+        compaction_text: str | None = None
+        if latest is not None:
+            compaction_text = latest[1].text
+            slice_history = history[latest[0] + 1:]
+        else:
+            slice_history = history
+        turn_messages = [m for m in slice_history if not isinstance(m, _LLM_EXCLUDED)]
+        system = system_prompt(
+            agent, contexts, project=project, compaction_summary=compaction_text
+        )
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
         turn_text = ""
@@ -385,6 +638,43 @@ async def run_user_turn(
                     yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
         except Exception as exc:  # noqa: BLE001
             code, message = classify_provider_error(exc)
+            # Reactive compaction: if the provider rejects for context length
+            # AND we haven't already compacted this turn AND the last message
+            # is a fresh UserText (i.e. we're at turn start, not mid-tool-loop
+            # — compacting across an unmatched ToolCall/ToolResult boundary
+            # would confuse the retry), summarize and retry the same iteration.
+            if (
+                code == "context_too_long"
+                and not compaction_used
+                and agent.compaction_enabled
+            ):
+                last_msg_check = load_history(conn, session_id)
+                if last_msg_check and isinstance(last_msg_check[-1], UserText):
+                    # Rewind the user message so the CompactionSummary can land
+                    # BEFORE it (and thus the retry's slice still sees the user
+                    # message). We re-append after compaction — the message
+                    # then becomes the first post-summary turn.
+                    conn.execute(
+                        "DELETE FROM messages WHERE session_id = ? AND seq = "
+                        "(SELECT MAX(seq) FROM messages WHERE session_id = ?)",
+                        (session_id, session_id),
+                    )
+                    compaction_used = True
+                    success = False
+                    async for c_evt in compact_session(
+                        conn=conn, config=config, agent=agent, session_id=session_id,
+                        reason="reactive:context_too_long",
+                        provider_factory=provider_factory,
+                    ):
+                        yield c_evt
+                        if isinstance(c_evt, CompactionCompletedEvent):
+                            success = True
+                    # Whether or not compaction succeeded, restore the user
+                    # message — either the retry needs it, or the RunError we're
+                    # about to persist needs the session to look consistent.
+                    append_message(conn, session_id, UserText(text=user_text))
+                    if success:
+                        continue  # retry this iteration with compacted history
             append_message(conn, session_id, RunError(code=code, message=message))
             yield RunErrorEvent(code=code, message=message)
             yield RunEnd(stop_reason=f"error:{code}")
@@ -453,6 +743,34 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
         }
     if isinstance(evt, RunErrorEvent):
         return {"type": "error", "code": evt.code, "message": evt.message}
+    if isinstance(evt, CompactionStartedEvent):
+        return {
+            "type": "compaction_started",
+            "reason": evt.reason,
+            "input_tokens": evt.input_tokens,
+            "context_window": evt.context_window,
+            "model": evt.model,
+        }
+    if isinstance(evt, CompactionCompletedEvent):
+        return {
+            "type": "compaction_completed",
+            "summary": evt.summary,
+            "reason": evt.reason,
+        }
+    if isinstance(evt, CompactionFailedEvent):
+        return {
+            "type": "compaction_failed",
+            "code": evt.code,
+            "message": evt.message,
+            "reason": evt.reason,
+        }
+    if isinstance(evt, CompactionSkippedEvent):
+        return {
+            "type": "compaction_skipped",
+            "reason": evt.reason,
+            "input_tokens": evt.input_tokens,
+            "context_window": evt.context_window,
+        }
     if isinstance(evt, RunEnd):
         return {"type": "done", "stop_reason": evt.stop_reason}
     if is_dataclass(evt):

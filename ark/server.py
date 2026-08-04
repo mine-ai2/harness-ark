@@ -296,6 +296,94 @@ def create_app(config: Config) -> FastAPI:
         runtime.delete_session(conn, sid)
         return {"ok": True}
 
+    @app.post("/agents/{name}/sessions/{sid}/compact")
+    async def compact_session_endpoint(name: str, sid: str, request: Request):
+        """Manually trigger compaction for a session.
+
+        Body is optional:
+        - `{}` or empty: server generates the summary via the session's own
+          provider (same summarizer as auto-triggered compactions).
+        - `{"summary": "..."}`: use the supplied text verbatim, no LLM call.
+
+        Same lifecycle events fire on `/events` as automatic compactions, so
+        any connected WS client sees the work happening. Respects the same
+        pending-tool-call guard as reactive compaction: if the session is
+        mid-tool-loop, returns 409. `compaction_enabled=false` on the agent
+        does NOT gate this endpoint — the client is explicitly asking.
+        """
+        agent = config.agents.get(name)
+        if agent is None:
+            raise HTTPException(404, "unknown agent")
+        if not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+
+        history = runtime.load_history(conn, sid)
+        if runtime.has_pending_tool_calls(history):
+            raise HTTPException(
+                409, "session has unmatched tool calls — wait for the turn to complete"
+            )
+
+        # Empty body is acceptable → server-generated.
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be an object")
+
+        supplied = body.get("summary")
+        if supplied is not None:
+            if not isinstance(supplied, str) or not supplied.strip():
+                raise HTTPException(400, "'summary' must be a non-empty string when provided")
+            # Client-supplied path: skip the LLM call entirely. Still publish
+            # the lifecycle events so WS clients see the same shape.
+            reason = "client-supplied"
+            started = {
+                "type": "compaction_started",
+                "session_id": sid, "agent_name": name,
+                "reason": reason, "input_tokens": None,
+                "context_window": None, "model": agent.model,
+            }
+            broker.publish(sid, started)
+            from .types import CompactionSummary
+            runtime.append_message(
+                conn, sid, CompactionSummary(text=supplied.strip(), reason=reason)
+            )
+            completed = {
+                "type": "compaction_completed",
+                "session_id": sid, "agent_name": name,
+                "summary": supplied.strip(), "reason": reason,
+            }
+            broker.publish(sid, completed)
+            return {"ok": True, "summary": supplied.strip(), "reason": reason}
+
+        # Server-generated: drive compact_session and publish each event.
+        summary_text = ""
+        fail_info: dict | None = None
+        async for evt in runtime.compact_session(
+            conn=conn, config=config, agent=agent, session_id=sid,
+            reason="client-invoked",
+        ):
+            wire = runtime.event_to_wire(evt)
+            wire["session_id"] = sid
+            wire["agent_name"] = name
+            broker.publish(sid, wire)
+            # Capture terminal state for the HTTP response.
+            from .types import (
+                CompactionCompletedEvent as _CE,
+                CompactionFailedEvent as _CF,
+            )
+            if isinstance(evt, _CE):
+                summary_text = evt.summary
+            elif isinstance(evt, _CF):
+                fail_info = {"code": evt.code, "message": evt.message}
+        if fail_info is not None:
+            return JSONResponse(
+                {"ok": False, "code": fail_info["code"], "message": fail_info["message"]},
+                status_code=502,
+            )
+        return {"ok": True, "summary": summary_text, "reason": "client-invoked"}
+
     # ------------------------------------------------------------------
     # Projects: shared user-visible working directories
     # ------------------------------------------------------------------

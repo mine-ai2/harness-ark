@@ -123,6 +123,25 @@ class RunError:
     message: str
 
 
+@dataclass
+class CompactionSummary:
+    """A summary of prior conversation, folded into the system prompt from
+    this row's position forward.
+
+    Persisted in history like any other message so clients can render the
+    compaction as a visual divider and expose the summary text to the user.
+    NOT sent to the LLM as a conversation turn — the runtime slices history
+    at the latest CompactionSummary and folds its `text` into the system
+    prompt as a new stanza.
+
+    Multiple compactions accumulate. The runtime always uses the LATEST one
+    as the slice point; older summaries stay in history as an audit trail
+    of what got dropped and when."""
+
+    text: str
+    reason: str = ""  # e.g. "auto:threshold(0.87)", "reactive:context_too_long"
+
+
 Message = Union[
     UserText,
     AssistantText,
@@ -133,6 +152,7 @@ Message = Union[
     SessionContext,
     TurnMetrics,
     RunError,
+    CompactionSummary,
 ]
 
 
@@ -214,6 +234,47 @@ class RunErrorEvent:
     message: str
 
 
+@dataclass
+class CompactionStartedEvent:
+    """Compaction is about to run. Clients can render "Compacting session…"
+    UX while awaiting completed/failed."""
+
+    reason: str            # e.g. "auto:threshold(0.87)", "reactive:context_too_long"
+    input_tokens: int | None = None
+    context_window: int | None = None
+    model: str = ""
+
+
+@dataclass
+class CompactionCompletedEvent:
+    """Compaction succeeded; CompactionSummary row persisted. Subsequent turns
+    will see only the summary + post-compaction messages."""
+
+    summary: str
+    reason: str = ""
+
+
+@dataclass
+class CompactionFailedEvent:
+    """Compaction attempt errored (summarizer call raised). The impending turn
+    proceeds uncompacted and will likely fail with context_too_long, which is
+    the existing recovery path."""
+
+    code: str  # classified provider error code
+    message: str
+    reason: str = ""
+
+
+@dataclass
+class CompactionSkippedEvent:
+    """Proactive threshold was crossed but compaction is disabled for this
+    agent. Emitted once per turn to alert the client without acting."""
+
+    reason: str            # "disabled:threshold(0.87)"
+    input_tokens: int | None = None
+    context_window: int | None = None
+
+
 ProviderEvent = Union[
     TextDelta, ThinkingDelta, ToolCallEvent, AssistantTurnEnd, TurnUsageEvent
 ]
@@ -226,6 +287,10 @@ RuntimeEvent = Union[
     RunEnd,
     TurnUsageEvent,
     RunErrorEvent,
+    CompactionStartedEvent,
+    CompactionCompletedEvent,
+    CompactionFailedEvent,
+    CompactionSkippedEvent,
 ]
 
 
@@ -279,6 +344,8 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
         }
     if isinstance(msg, RunError):
         return "run_error", {"code": msg.code, "message": msg.message}
+    if isinstance(msg, CompactionSummary):
+        return "compaction_summary", {"text": msg.text, "reason": msg.reason}
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -325,4 +392,8 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
         )
     if role == "run_error":
         return RunError(code=content.get("code", "other"), message=content.get("message", ""))
+    if role == "compaction_summary":
+        return CompactionSummary(
+            text=content.get("text", ""), reason=content.get("reason", "")
+        )
     raise ValueError(f"unknown role: {role}")
