@@ -1,0 +1,19 @@
+{
+  "server": {
+    "host": "${ARK_HOST}",
+    "port": ${ARK_PORT},
+    "auth_secret": "${ARK_AUTH_SECRET}"
+  },
+  "providers": {
+    "anthropic": {
+      "provider_type": "anthropic",
+      "api_key": "${ANTHROPIC_API_KEY}"
+    }
+  },
+  "agents": {
+    "talos": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6"
+    }
+  }
+}
