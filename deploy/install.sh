@@ -4,7 +4,8 @@
 # What it does: service user, venv + deps at /opt/harness-ark/.venv, data
 # volume permissions, systemd unit install + enable.
 # What it does NOT do: create/mount the data volume (#469), render
-# config.json from the template (#470), or start the service.
+# config.json from the template (render-config.sh / deploy-remote.sh), or
+# start the service.
 set -Eeuo pipefail
 
 APP_DIR=/opt/harness-ark
@@ -36,6 +37,13 @@ if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
     echo "installing python3-venv..."
     apt-get update -qq
     apt-get install -y -qq python3-venv
+fi
+
+# Deploys render config.json with envsubst (render-config.sh); guarantee it.
+if ! command -v envsubst >/dev/null 2>&1; then
+    echo "installing gettext-base (envsubst)..."
+    apt-get update -qq
+    apt-get install -y -qq gettext-base
 fi
 
 # --- Service user ------------------------------------------------------------
@@ -80,9 +88,9 @@ systemctl enable ark
 
 cat <<EOF
 install.sh: done. Next steps:
-  1. Render the config template (see deploy/README.md for the variables):
-       envsubst '\$ARK_HOST \$ARK_PORT \$ARK_AUTH_SECRET \$ANTHROPIC_API_KEY' \\
-         < $APP_DIR/deploy/config/config.json.tmpl > /tmp/config.json
+  1. Render the config template (export the variables documented in
+     deploy/README.md, then):
+       $APP_DIR/deploy/render-config.sh > /tmp/config.json
        install -o $SERVICE_USER -g $SERVICE_USER -m 0600 /tmp/config.json $DATA_DIR/config.json
        rm /tmp/config.json
   2. systemctl start ark
