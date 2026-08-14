@@ -37,7 +37,7 @@ jobs:
         # leftovers break json.tool, quoted ones trip the grep.
         run: |
           export ARK_HOST=127.0.0.1 ARK_PORT=7777 ARK_AUTH_SECRET=dummy \
-                 ANTHROPIC_API_KEY=dummy MINEAI_GATEWAY_URL=http://localhost:1 \
+                 OPENAI_API_KEY=dummy MINEAI_GATEWAY_URL=http://localhost:1 \
                  MINEAI_GATEWAY_SECRET=dummy
           deploy/render-config.sh deploy/config/config.json.tmpl > /tmp/rendered.json
           python3 -m json.tool /tmp/rendered.json > /dev/null

@@ -213,7 +213,7 @@ KNOWN
 
 Still needed from the operator (never printed here):
   gh secret set ARK_AUTH_SECRET       --env $GH_ENV   # openssl rand -hex 32, unique per env
-  gh secret set ANTHROPIC_API_KEY     --env $GH_ENV
+  gh secret set OPENAI_API_KEY     --env $GH_ENV
   gh secret set MINEAI_GATEWAY_URL    --env $GH_ENV
   gh secret set MINEAI_GATEWAY_SECRET --env $GH_ENV
 
