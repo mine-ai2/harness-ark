@@ -12,3 +12,4 @@ venv/
 *.db-shm
 .DS_Store
 .ark-home/
+.env
