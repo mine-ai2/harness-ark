@@ -5,9 +5,9 @@
     "auth_secret": "${ARK_AUTH_SECRET}"
   },
   "providers": {
-    "anthropic": {
-      "provider_type": "anthropic",
-      "api_key": "${ANTHROPIC_API_KEY}"
+    "openai": {
+      "provider_type": "openai",
+      "api_key": "${OPENAI_API_KEY}"
     }
   },
   "tools": {
@@ -18,8 +18,8 @@
   },
   "agents": {
     "talos": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "provider": "openai",
+      "model": "gpt-5-mini"
     }
   }
 }
