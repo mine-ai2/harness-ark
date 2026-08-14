@@ -7,7 +7,8 @@
 # only ever deploys a commit whose dev deploy already passed the health gate.
 # Each environment carries its own secrets (ANTHROPIC_API_KEY,
 # ARK_AUTH_SECRET, MINEAI_GATEWAY_URL, MINEAI_GATEWAY_SECRET,
-# SSH_PRIVATE_KEY) and variables (DEPLOY_HOST, DEPLOY_USER, SSH_KNOWN_HOSTS).
+# SSH_PRIVATE_KEY) and variables (DEPLOY_HOST, DEPLOY_USER, DEPLOY_DOMAIN,
+# SSH_KNOWN_HOSTS).
 # Remote-side logic lives in deploy/deploy-remote.sh, which ships with the
 # rsync so runner and remote can never version-skew.
 name: talos-deploy
@@ -84,6 +85,16 @@ jobs:
             < "$RUNNER_TEMP/deploy.env"
           rm -f "$RUNNER_TEMP/deploy.env"
 
+      - name: External smoke test
+        env:
+          ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
+          DEPLOY_DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+        # Exercises DNS + Caddy TLS + the WebSocket proxy path from the
+        # runner — the loopback health gate in deploy-remote.sh cannot.
+        run: |
+          pip install --quiet 'websockets>=13.0'
+          deploy/scripts/smoke.sh "$DEPLOY_DOMAIN"
+
   # Same steps as deploy-dev (GitHub Actions has no YAML anchors; keep the
   # two jobs textually in sync), resolving secrets/vars from the production
   # environment instead.
@@ -143,3 +154,11 @@ jobs:
             'sudo /opt/harness-ark/deploy/deploy-remote.sh' \
             < "$RUNNER_TEMP/deploy.env"
           rm -f "$RUNNER_TEMP/deploy.env"
+
+      - name: External smoke test
+        env:
+          ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
+          DEPLOY_DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+        run: |
+          pip install --quiet 'websockets>=13.0'
+          deploy/scripts/smoke.sh "$DEPLOY_DOMAIN"

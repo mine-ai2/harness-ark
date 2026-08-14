@@ -1,0 +1,90 @@
+#cloud-config
+# First-boot configuration for a harness droplet (mine-capstone#469).
+# Rendered by deploy/scripts/render-user-data.sh (envsubst) — template
+# variables are ${DOMAIN}, ${VOLUME_NAME}, ${DEPLOY_PUBKEY}; every other
+# $ in this file is shell syntax that must survive rendering, which is why
+# the render script's variable allowlist is load-bearing.
+#
+# Passed to `doctl compute droplet create --user-data-file`; runs ONCE on
+# first boot. Rebuilding a droplet against an existing data volume is safe:
+# the mkfs below is guarded on the volume being blank.
+
+# Single deploy user (this intentionally drops the default ubuntu user).
+# NOPASSWD sudo is required by the deploy workflow (`--rsync-path='sudo
+# rsync'` and deploy-remote.sh). Root break-glass keys are installed by the
+# DigitalOcean --ssh-keys mechanism, independent of cloud-init.
+users:
+  - name: deploy
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "${DEPLOY_PUBKEY}"
+
+write_files:
+  # Named 10-* so it sorts before Ubuntu's 50-cloud-init.conf: sshd's
+  # Include sits at the top of sshd_config and the FIRST match wins.
+  - path: /etc/ssh/sshd_config.d/10-harness.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      # Key-only root as break-glass (DO account keys); password root never.
+      PermitRootLogin prohibit-password
+      AllowUsers root deploy
+
+  # Staged here and installed over /etc/caddy/Caddyfile AFTER the caddy
+  # package install — the Caddyfile is a dpkg conffile; pre-writing the
+  # real path risks conffile-prompt behavior under noninteractive apt.
+  - path: /etc/caddy/Caddyfile.harness
+    permissions: "0644"
+    content: |
+      # Managed by deploy/cloud-init/user-data.tmpl.yml (harness-ark repo).
+      # Caddy proxies WebSocket upgrades automatically and has NO default
+      # proxy read timeout, so long-lived /events sockets survive — do not
+      # add one. Port 80 is closed at the DO firewall, so force the
+      # 443-only TLS-ALPN-01 ACME challenge instead of letting HTTP-01
+      # attempts fail and slow issuance.
+      ${DOMAIN} {
+          reverse_proxy 127.0.0.1:7777
+          tls {
+              issuer acme {
+                  disable_http_challenge
+              }
+          }
+      }
+
+runcmd:
+  - |
+    set -e
+
+    # --- Data volume: format-if-blank, fstab (nofail), mount ------------
+    dev="/dev/disk/by-id/scsi-0DO_Volume_${VOLUME_NAME}"
+    for i in $(seq 1 30); do [ -e "$dev" ] && break; sleep 2; done
+    [ -e "$dev" ] || { echo "volume device $dev never appeared" >&2; exit 1; }
+    # Guard: only format a blank volume. A rebuilt droplet attached to an
+    # existing data volume must never lose its data here.
+    if ! blkid "$dev" > /dev/null 2>&1; then
+        mkfs.ext4 -L harness-data "$dev"
+    fi
+    mkdir -p /mnt/harness-data
+    line="$dev /mnt/harness-data ext4 defaults,nofail,discard 0 2"
+    grep -qF "$dev" /etc/fstab || echo "$line" >> /etc/fstab
+    systemctl daemon-reload
+    mountpoint -q /mnt/harness-data || mount /mnt/harness-data
+
+    # --- Apply sshd hardening drop-in -----------------------------------
+    systemctl restart ssh
+
+    # --- Caddy (official apt repo), then install our Caddyfile ----------
+    apt-get update -qq
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y -qq caddy
+    install -m 0644 /etc/caddy/Caddyfile.harness /etc/caddy/Caddyfile
+    systemctl enable --now caddy
+    systemctl reload caddy

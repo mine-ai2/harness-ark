@@ -29,8 +29,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh
-      - run: bash -n deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh
+      - run: shellcheck deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh deploy/scripts/provision.sh deploy/scripts/smoke.sh deploy/scripts/render-user-data.sh
+      - run: bash -n deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh deploy/scripts/provision.sh deploy/scripts/smoke.sh deploy/scripts/render-user-data.sh
       - name: Config render test
         # Exercises the exact script deploys use, so a template variable
         # missing from render-config.sh's allowlist fails here: unquoted
@@ -42,3 +42,16 @@ jobs:
           deploy/render-config.sh deploy/config/config.json.tmpl > /tmp/rendered.json
           python3 -m json.tool /tmp/rendered.json > /dev/null
           ! grep -q '\${' /tmp/rendered.json
+      - name: User-data render test
+        # Same drift guard for the cloud-init template: renders through the
+        # exact script provision.sh uses, must stay valid YAML, and only
+        # the three allowlisted variables may be substituted (every other
+        # $ is shell syntax inside runcmd).
+        run: |
+          export DOMAIN=harness-test.example.com VOLUME_NAME=harness-test-data \
+                 DEPLOY_PUBKEY='ssh-ed25519 AAAA_dummy harness-test-deploy'
+          deploy/scripts/render-user-data.sh deploy/cloud-init/user-data.tmpl.yml > /tmp/user-data.yml
+          pip install --quiet pyyaml
+          python3 -c 'import yaml; yaml.safe_load(open("/tmp/user-data.yml"))'
+          ! grep -qE '\$\{(DOMAIN|VOLUME_NAME|DEPLOY_PUBKEY)\}' /tmp/user-data.yml
+          head -1 /tmp/user-data.yml | grep -qx '#cloud-config'
