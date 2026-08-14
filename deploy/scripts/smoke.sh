@@ -84,11 +84,19 @@ def fail(msg):
 async def roundtrip(ws, label):
     # The server sends nothing on connect; the documented reply to an
     # unsupported command type is the reliable liveness probe (never send
-    # user_message here — it would start a real agent turn).
+    # user_message here — it would start a real agent turn). The socket
+    # also broadcasts every session's events, so on a live system the
+    # reply may be interleaved with unrelated frames: skip until we see
+    # our error frame or the deadline passes.
     await ws.send(json.dumps({"type": "ping"}))
-    reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-    if reply.get("type") != "error" or "unsupported command type" not in reply.get("message", ""):
-        fail(f"{label}: unexpected reply: {reply!r}")
+    deadline = asyncio.get_event_loop().time() + 10
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            fail(f"{label}: no reply to probe within 10s")
+        reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+        if reply.get("type") == "error" and "unsupported command type" in reply.get("message", ""):
+            break
     ok(label)
 
 
