@@ -41,7 +41,136 @@ Three independent layers:
 `.mount` unit. `RequiresMountsFor` needs that mount unit to exist; a raw
 `mount` command at provision time is not enough across reboots.
 
+## Provisioning (DigitalOcean)
+
+Scripted-manual v1 (no Terraform precedent in this org):
+[scripts/provision.sh](scripts/provision.sh) drives `doctl`, cloud-init does
+first-boot configuration, and this section is the runbook. Script placement
+rule: flat `deploy/*.sh` scripts run **on the VM**; `deploy/scripts/*.sh`
+run **from outside it** (operator laptop or CI runner).
+
+### What one environment is
+
+Per environment (`dev` → GitHub environment `development`, `prod` →
+`production`) — dev and prod share **nothing**:
+
+| Resource | Name (dev shown) | Notes |
+|---|---|---|
+| Droplet | `harness-dev` | `s-2vcpu-4gb`, `ubuntu-24-04-x64`, region `nyc3`, VPC `mineai-internal` |
+| Volume | `harness-dev-data` | 10 GiB block storage, ext4, mounted `/mnt/harness-data` |
+| Firewall | `harness-dev-fw` | inbound tcp 22 + 443 only, applied by tag |
+| DNS | `harness-dev.mine.ai` | A record in the DO-managed `mine.ai` zone, TTL 300 |
+| Deploy keypair | `~/.ssh/harness-dev-deploy` | ed25519, no passphrase (CI consumes it) |
+| Tag | `harness-dev` (+ shared label `harness`) | binds firewall to droplet |
+
+Cost: ~$25/mo per environment (~$50 total for both).
+
+### Provision an environment
+
+Prerequisites: authenticated `doctl` and `gh`; the DO account's SSH keys
+("Main", "milo-agent") act as root break-glass.
+
+```sh
+deploy/scripts/provision.sh dev    # or: prod
+```
+
+Idempotent converge — safe to re-run after a partial failure; existing
+resources are kept. The droplet's cloud-init
+([cloud-init/user-data.tmpl.yml](cloud-init/user-data.tmpl.yml), rendered
+by [scripts/render-user-data.sh](scripts/render-user-data.sh)) runs on
+**first boot only**: it formats the volume *only if blank*, writes the
+fstab entry (`nofail`), creates the `deploy` user, hardens sshd, and
+installs Caddy with the environment's domain. To reapply cloud-init,
+delete the droplet and re-run provision.sh — the data volume survives
+because of the format-if-blank guard.
+
+The script ends by verifying first boot over SSH (`cloud-init status`,
+mountpoint, caddy active) and printing the exact `gh` commands that wire
+the GitHub environment (`SSH_PRIVATE_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`,
+`DEPLOY_DOMAIN`, `SSH_KNOWN_HOSTS`). Four secrets remain operator-supplied:
+`ARK_AUTH_SECRET` (`openssl rand -hex 32`, unique per env),
+`ANTHROPIC_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`.
+
+Until the first deploy runs, `https://<domain>/health` returns **502 —
+this is expected**: Caddy is up (cert issuance takes 1–5 min once the DNS
+record lands; watch `journalctl -u caddy`) but ark isn't installed yet.
+The first talos-deploy run fixes that.
+
+### Access model
+
+- Day-to-day: `ssh -i ~/.ssh/harness-<env>-deploy deploy@<IP>` — the same
+  key CI uses. NOPASSWD sudo (required by the deploy workflow's
+  `--rsync-path='sudo rsync'` and deploy-remote.sh).
+- Break-glass: key-only root SSH using the DO account keys
+  (`PermitRootLogin prohibit-password`; password root login is off).
+- Port 22 is open to 0.0.0.0/0 **by necessity**: GitHub-hosted runners
+  have no stable egress CIDRs (thousands of ranges vs the DO firewall's
+  ~50-rule cap). The control is key-only auth: password and interactive
+  auth are disabled by the sshd drop-in, and only `root` and `deploy` may
+  log in.
+
+### Firewall
+
+The DO cloud firewall is the single enforcement layer: inbound tcp 22 and
+443, all outbound. Port 80 stays closed — Caddy is configured for the
+443-only TLS-ALPN-01 ACME challenge (`disable_http_challenge`). ufw is
+deliberately **not** enabled on the host (one source of truth; the only
+listeners are caddy and key-only sshd — ark binds loopback). If you want
+belt-and-suspenders anyway:
+
+```sh
+sudo ufw default deny incoming && sudo ufw allow 22/tcp && sudo ufw allow 443/tcp && sudo ufw enable
+```
+
+Caddy is the chosen proxy (automatic certs, WebSocket upgrades handled
+natively, no default proxy read timeout so long-lived `/events` sockets
+survive). If it ever needs replacing, the nginx fallback config —
+including the WebSocket upgrade headers and `proxy_read_timeout` — is in
+[docs/deploy.md](../docs/deploy.md); remember to open port 80 or keep
+TLS-ALPN-01 for ACME.
+
+### Smoke tests
+
+[scripts/smoke.sh](scripts/smoke.sh) runs from an external network and
+exercises DNS + TLS + the WebSocket proxy path: `/health` over TLS,
+unauthenticated `/events` rejected, authenticated `/events` round-trip.
+CI runs it after every deploy; run it manually with:
+
+```sh
+ARK_AUTH_SECRET=... deploy/scripts/smoke.sh harness-dev.mine.ai
+ARK_AUTH_SECRET=... deploy/scripts/smoke.sh harness-dev.mine.ai --soak 330   # >5 min WS soak
+```
+
+(Needs `pip install 'websockets>=13.0'` locally.)
+
+### Teardown / rebuild
+
+Droplet-only rebuild (keeps all data — the volume is never formatted when
+it already has a filesystem):
+
+```sh
+doctl compute droplet delete harness-dev
+deploy/scripts/provision.sh dev      # recreates droplet, re-runs cloud-init
+# then update DEPLOY_HOST + SSH_KNOWN_HOSTS in the GitHub environment and redeploy
+```
+
+Full teardown (destroys data; rotate the GH environment secrets after):
+
+```sh
+doctl compute droplet delete harness-dev
+doctl compute volume delete <id of harness-dev-data>
+doctl compute firewall delete <id of harness-dev-fw>
+doctl compute domain records delete mine.ai <id of harness-dev A record>
+```
+
+Note Let's Encrypt's duplicate-certificate limit (5/week) if repeatedly
+tearing down and re-provisioning the same domain.
+
 ## Fresh VM bring-up
+
+This is the **manual** path. On a provisioned droplet the CI deploy makes
+it unnecessary: the workflow rsyncs the repo to `/opt/harness-ark` and runs
+everything below itself — no on-VM clone required.
 
 ```sh
 sudo git clone https://github.com/mine-ai2/harness-ark /opt/harness-ark
@@ -104,9 +233,12 @@ settings → Environments, both with deployment-branch policy `main`:
 Per-environment **secrets**: `ANTHROPIC_API_KEY`, `ARK_AUTH_SECRET`,
 `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`, `SSH_PRIVATE_KEY` (dedicated
 ed25519 deploy key per environment). Per-environment **variables**:
-`DEPLOY_HOST`, `DEPLOY_USER` (the `deploy` user below), `SSH_KNOWN_HOSTS`
-(output of `ssh-keyscan -t ed25519 <host>`, captured at provision time — the
-workflow pins it with `StrictHostKeyChecking=yes`).
+`DEPLOY_HOST` (droplet IP — SSH stays independent of DNS health),
+`DEPLOY_USER` (the `deploy` user below), `DEPLOY_DOMAIN` (the environment's
+FQDN, used by the post-deploy smoke test), `SSH_KNOWN_HOSTS` (output of
+`ssh-keyscan -t ed25519 <host>`, captured at provision time — the workflow
+pins it with `StrictHostKeyChecking=yes`). `provision.sh` emits all of
+these ready to paste.
 
 Each deploy: rsync the repo to `/opt/harness-ark` (excluding `.venv`, which
 holds the live interpreter), then run
@@ -118,10 +250,12 @@ removed manually), restarts the unit, and fails the run unless `/health`
 returns 200. Secrets travel to the VM over ssh stdin only — never argv,
 never a persisted file — and the scripts never `set -x`.
 
-**VM contract** (provisioning, mine-capstone#469): a `deploy` user whose
-`authorized_keys` holds the environment's deploy public key, with passwordless
-sudo (`deploy ALL=(ALL) NOPASSWD:ALL` — needed for `--rsync-path='sudo
-rsync'` and the remote script; root login stays disabled).
+**VM contract** (satisfied by cloud-init at provision time — see
+"Provisioning" above): a `deploy` user whose `authorized_keys` holds the
+environment's deploy public key, with passwordless sudo
+(`deploy ALL=(ALL) NOPASSWD:ALL` — needed for `--rsync-path='sudo rsync'`
+and the remote script). Password root login is disabled; key-only root
+remains as break-glass via the DO account keys.
 
 **No rollback**: a failure after the restart leaves the new code live —
 fix forward. A failure before then (including any render/validation error)
@@ -142,10 +276,6 @@ leaves the old code, config, and service untouched.
 
 ## Intentionally not here
 
-- **TLS / reverse proxy** — use the Caddy or nginx WebSocket-aware configs
-  in [docs/deploy.md](../docs/deploy.md). The API must stay loopback-only
-  behind it.
-- **Droplet + volume provisioning** — mine-capstone#469.
 - **Upstream sync process** — mine-capstone#471.
 
 ## Backups
