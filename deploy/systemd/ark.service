@@ -1,0 +1,36 @@
+[Unit]
+Description=Ark agent harness (Talos)
+Wants=network-online.target
+After=network-online.target
+# Binds this unit to the data volume's mount unit: RequiresMountsFor adds both
+# Requires= and After= on the mount unit covering the path, so the service
+# fails if the volume isn't mounted instead of writing to the root disk.
+# The mount unit must exist — the volume needs an /etc/fstab entry (with
+# `nofail`) or an explicit .mount unit; see deploy/README.md.
+RequiresMountsFor=/mnt/harness-data
+# Assert (not Condition): a failed Condition silently skips the start with
+# exit 0; an Assert fails it loudly. Covers the case where the mount unit
+# doesn't exist at all and the path is a plain directory on the root disk.
+AssertPathIsMountPoint=/mnt/harness-data
+
+[Service]
+Type=simple
+User=ark
+Group=ark
+# Load-bearing: there is no install step; `python -m ark` resolves the ark
+# package from the working directory.
+WorkingDirectory=/opt/harness-ark
+Environment=ARK_HOME=/mnt/harness-data
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/harness-ark/.venv/bin/python -m ark serve
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no sandbox hardening (ProtectSystem, ProtectHome,
+# NoNewPrivileges, PrivateTmp): agents get real shell access via run_command
+# by design. The unprivileged `ark` user is the security boundary.
+
+[Install]
+WantedBy=multi-user.target
