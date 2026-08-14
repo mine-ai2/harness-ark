@@ -48,8 +48,11 @@ while IFS= read -r line; do
     [[ $line == *=* ]] || die "malformed stdin line (expected KEY=VALUE)"
     export "${line%%=*}=${line#*=}"
 done < "$envfile"
-: "${ARK_HOST:=127.0.0.1}"
-: "${ARK_PORT:=7777}"
+# export, not just assign: render-config.sh runs as a child process and
+# must see these (the stdin loop above exports every provided key, but
+# these defaults apply when the workflow doesn't send them).
+export ARK_HOST="${ARK_HOST:-127.0.0.1}"
+export ARK_PORT="${ARK_PORT:-7777}"
 
 # --- Phase 1: install (venv + deps, unit refresh, permissions) ---------------
 

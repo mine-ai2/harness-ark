@@ -1,6 +1,6 @@
 #cloud-config
 # First-boot configuration for a harness droplet (mine-capstone#469).
-# Rendered by deploy/scripts/render-user-data.sh (envsubst) — template
+# Rendered by deploy/scripts/render-user-data.sh (envsubst) -- template
 # variables are ${DOMAIN}, ${VOLUME_NAME}, ${DEPLOY_PUBKEY}; every other
 # $ in this file is shell syntax that must survive rendering, which is why
 # the render script's variable allowlist is load-bearing.
@@ -34,14 +34,14 @@ write_files:
       AllowUsers root deploy
 
   # Staged here and installed over /etc/caddy/Caddyfile AFTER the caddy
-  # package install — the Caddyfile is a dpkg conffile; pre-writing the
+  # package install -- the Caddyfile is a dpkg conffile; pre-writing the
   # real path risks conffile-prompt behavior under noninteractive apt.
   - path: /etc/caddy/Caddyfile.harness
     permissions: "0644"
     content: |
       # Managed by deploy/cloud-init/user-data.tmpl.yml (harness-ark repo).
       # Caddy proxies WebSocket upgrades automatically and has NO default
-      # proxy read timeout, so long-lived /events sockets survive — do not
+      # proxy read timeout, so long-lived /events sockets survive -- do not
       # add one. Port 80 is closed at the DO firewall, so force the
       # 443-only TLS-ALPN-01 ACME challenge instead of letting HTTP-01
       # attempts fail and slow issuance.

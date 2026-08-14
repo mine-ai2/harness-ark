@@ -55,3 +55,6 @@ jobs:
           python3 -c 'import yaml; yaml.safe_load(open("/tmp/user-data.yml"))'
           ! grep -qE '\$\{(DOMAIN|VOLUME_NAME|DEPLOY_PUBKEY)\}' /tmp/user-data.yml
           head -1 /tmp/user-data.yml | grep -qx '#cloud-config'
+          # Non-ASCII in user-data gets mangled to C1 control chars on the
+          # DO metadata path, making cloud-init discard the whole config.
+          ! LC_ALL=C grep -q '[^ -~]' /tmp/user-data.yml
