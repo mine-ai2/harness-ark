@@ -26,5 +26,14 @@ for var in "${REQUIRED_VARS[@]}"; do
     }
 done
 
-envsubst "$(printf '$%s ' "${REQUIRED_VARS[@]}")" \
-    < "${1:-$SCRIPT_DIR/../cloud-init/user-data.tmpl.yml}"
+# ASCII-only guard: the DO metadata path can decode user-data as latin-1,
+# turning multi-byte UTF-8 into C1 control chars that make cloud-init's
+# YAML loader discard the ENTIRE config (observed with em dashes: cloud-init
+# reports "unacceptable character #x0080" and boots an unconfigured VM).
+out="$(envsubst "$(printf '$%s ' "${REQUIRED_VARS[@]}")" \
+    < "${1:-$SCRIPT_DIR/../cloud-init/user-data.tmpl.yml}")"
+if LC_ALL=C grep -q '[^ -~]' <<<"$out"; then
+    echo "render-user-data.sh: error: rendered user-data contains non-ASCII characters (template or variables)" >&2
+    exit 1
+fi
+printf '%s\n' "$out"

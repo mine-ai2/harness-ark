@@ -166,9 +166,13 @@ fi
 
 # --- Host key scan (droplet active != sshd ready: retry) ---------------------
 
+# ssh-keyscan may emit its "# host:port banner" comment on stdout (macOS
+# does) — take the first real key line, never the comment.
 HOSTKEY=""
 for _ in $(seq 1 36); do
-    HOSTKEY="$(ssh-keyscan -t ed25519 -T 5 "$IP" 2>/dev/null | head -1)" && [[ -n $HOSTKEY ]] && break
+    HOSTKEY="$(ssh-keyscan -t ed25519 -T 5 "$IP" 2>/dev/null \
+        | awk '!/^#/ && $2 == "ssh-ed25519" {print; exit}')" || true
+    [[ -n $HOSTKEY ]] && break
     sleep 5
 done
 [[ -n $HOSTKEY ]] || die "ssh-keyscan never succeeded against $IP"
