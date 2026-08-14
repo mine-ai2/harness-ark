@@ -8,6 +8,12 @@
 # start the service.
 set -Eeuo pipefail
 
+# Explicit umask: this script creates system-wide resources (the venv the
+# `ark` user executes, the systemd unit) and must not inherit a restrictive
+# caller umask — deploy-remote.sh runs under umask 077 for its secret temp
+# files, which once produced a root-only venv and a 203/EXEC crashloop.
+umask 022
+
 APP_DIR=/opt/harness-ark
 DATA_DIR=/mnt/harness-data
 SERVICE_USER=ark
