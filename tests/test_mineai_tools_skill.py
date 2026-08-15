@@ -145,3 +145,52 @@ def test_env_fallback_when_config_block_missing(skill, tool_context, monkeypatch
     json.loads(skill.mineai_list_tools())
     assert seen["url"].startswith("https://env.example.com/")
     assert seen["headers"]["X-Harness-Secret"] == "env-secret"
+
+
+# ---------------------------------------------------------------------------
+# Per-session metadata resolution (mine-capstone#528)
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_pair_beats_config_and_env(skill, tool_context, monkeypatch):
+    tool_context.metadata = {
+        "mineai_gateway": {"url": "https://per-session.example/", "secret": "meta-secret"}
+    }
+    monkeypatch.setenv("MINEAI_GATEWAY_URL", "https://env.example")
+    monkeypatch.setenv("MINEAI_GATEWAY_SECRET", "env-secret")
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen.update(url=url, headers=headers)
+        return _Response(200, {"ok": True, "tools": []})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert json.loads(skill.mineai_list_tools())["ok"] is True
+    assert seen["url"] == "https://per-session.example/api/agent-gateway/list-tools"
+    assert seen["headers"] == {"X-Harness-Secret": "meta-secret"}
+
+
+def test_incomplete_metadata_pair_never_mixes_with_config(skill, tool_context, monkeypatch):
+    """Confused-deputy guard: a session-supplied url without its secret must
+    NOT be completed from the deployment's config/env secret."""
+    tool_context.metadata = {"mineai_gateway": {"url": "https://rogue.example"}}
+    calls = []
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: calls.append(1))
+    result = json.loads(skill.mineai_list_tools())
+    assert calls == []  # no request left the harness
+    assert result["ok"] is False
+    assert result["error"]["code"] == "gateway_not_configured"
+
+
+def test_absent_metadata_falls_back_to_config(skill, tool_context, monkeypatch):
+    tool_context.metadata = {}
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen.update(url=url, headers=headers)
+        return _Response(200, {"ok": True, "tools": []})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert json.loads(skill.mineai_list_tools())["ok"] is True
+    assert seen["url"].startswith("https://api.example.com/")
+    assert seen["headers"] == {"X-Harness-Secret": "s3cret"}
