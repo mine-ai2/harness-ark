@@ -274,9 +274,36 @@ leaves the old code, config, and service untouched.
   real shell access via `run_command` by design, and the unprivileged `ark`
   user is the security boundary. Don't "fix" this.
 
-## Intentionally not here
+## Upstream sync
 
-- **Upstream sync process** — mine-capstone#471.
+This repo is a fork: `origin = mine-ai2/harness-ark`, `upstream =
+druths/ark` (the sync script adds the `upstream` remote if missing).
+
+**Fork rules (additive-only):**
+
+- MineAI-specific code lives **only** in `deploy/` and the `talos-*`
+  workflows (plus the root `CONTRIBUTING.md` pointer). Nothing else in the
+  tree may diverge from upstream.
+- Any change under `ark/` core must be an upstream-PR candidate — written
+  as if druths/ark would merge it, never a MineAI-only hack.
+- The two currently sanctioned core extensions are: real mid-turn cancel
+  (mine-capstone#485, branch `ark-real-cancel`) and per-agent `max_tokens`
+  (mine-capstone#481, `talos-provisioning`).
+
+**Process:** run [scripts/sync-upstream.sh](scripts/sync-upstream.sh) from
+any clean checkout. It fetches both remotes; if upstream is already
+contained in `main` it says so and exits. Otherwise it creates
+`sync/ark-YYYY-MM-DD` from `origin/main`, merges `upstream/main`, pushes,
+and opens a PR — CI (talos-test) validates the merged tree before it can
+land. Merge the PR like any other; never sync by pushing to `main`
+directly.
+
+**Conflicts** should not happen if the rules above hold (upstream doesn't
+touch `deploy/`; the fork doesn't touch `ark/`). If one occurs, the script
+leaves the merge in progress on the sync branch: prefer the upstream side
+for `ark/` core unless the conflicting change is a sanctioned extension,
+resolve, commit, push, and open the PR manually (the script prints the
+commands).
 
 ## Backups
 

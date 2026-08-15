@@ -29,8 +29,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh deploy/scripts/provision.sh deploy/scripts/smoke.sh deploy/scripts/render-user-data.sh
-      - run: bash -n deploy/install.sh deploy/deploy-remote.sh deploy/render-config.sh deploy/scripts/provision.sh deploy/scripts/smoke.sh deploy/scripts/render-user-data.sh
+      - run: shellcheck deploy/*.sh deploy/scripts/*.sh
+      - run: bash -n deploy/*.sh deploy/scripts/*.sh
       - name: Config render test
         # Exercises the exact script deploys use, so a template variable
         # missing from render-config.sh's allowlist fails here: unquoted
