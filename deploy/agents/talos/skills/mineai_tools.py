@@ -6,9 +6,15 @@ server-side to the acting user + per-session tool set + policy, so no
 credential ever transits model context. Lives in the talos agent dir on
 purpose: other harness agents must not inherit MineAI reach.
 
-Gateway config comes from ``tools.mineai_gateway`` in config.json (rendered
-from MINEAI_GATEWAY_URL / MINEAI_GATEWAY_SECRET at deploy time), with the
-raw env vars as fallback for local runs.
+Gateway resolution order (mine-capstone#528): the per-session callback pair
+in ``current_context().metadata["mineai_gateway"]`` (supplied by MineAI at
+session create — lets one harness serve callbacks without any deploy-time
+gateway config), then ``tools.mineai_gateway`` in config.json (rendered
+from MINEAI_GATEWAY_URL / MINEAI_GATEWAY_SECRET at deploy time), then the
+raw env vars for local runs. A metadata pair is all-or-nothing: when the
+session supplies one, its url and secret are used together and NEVER mixed
+with config/env halves — a session pointing the url elsewhere must not be
+able to harvest the deployment's secret (confused-deputy guard).
 """
 
 from __future__ import annotations
@@ -30,6 +36,15 @@ class _GatewayNotConfigured(Exception):
 
 def _gateway() -> "tuple[str, str]":
     ctx = current_context()
+    meta = (getattr(ctx, "metadata", None) or {}).get("mineai_gateway")
+    if meta is not None:
+        # Pair-travel invariant: session-supplied url+secret are used
+        # together or not at all — never completed from config/env.
+        url = ((meta.get("url") if isinstance(meta, dict) else "") or "").rstrip("/")
+        secret = (meta.get("secret") if isinstance(meta, dict) else "") or ""
+        if not url or not secret:
+            raise _GatewayNotConfigured
+        return url, secret
     cfg = (getattr(ctx.config, "tools", None) or {}).get("mineai_gateway") or {}
     url = (cfg.get("url") or os.environ.get("MINEAI_GATEWAY_URL", "")).rstrip("/")
     secret = cfg.get("secret") or os.environ.get("MINEAI_GATEWAY_SECRET", "")
