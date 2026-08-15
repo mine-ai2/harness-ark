@@ -340,6 +340,7 @@ async def run_user_turn(
                 system=system,
                 messages=turn_messages,
                 tools=active,
+                max_tokens=agent.max_tokens or 4096,
             ):
                 if isinstance(evt, TextDelta):
                     turn_text += evt.text
