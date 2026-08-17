@@ -189,8 +189,8 @@ Then render the config. Variables:
 | `ARK_HOST` | `127.0.0.1` — bearer token is the only auth; keep the port loopback-only behind the TLS proxy |
 | `ARK_PORT` | `7777` |
 | `ARK_AUTH_SECRET` | long random string: `openssl rand -hex 32` |
-| `OPENAI_API_KEY` | provider key (talos runs on gpt-5-mini) |
-| `DO_INFERENCE_API_KEY` | DigitalOcean inference router key (`providers.do`, OpenAI-compatible at inference.do-ai.run) |
+| `OPENAI_API_KEY` | OpenAI provider key (standby provider) |
+| `DO_INFERENCE_API_KEY` | DigitalOcean inference router key (`providers.do`; talos runs on `kimi-k3`) |
 | `MINEAI_GATEWAY_URL` | MineAI gateway endpoint (rendered into the `tools.mineai_gateway` passthrough) |
 | `MINEAI_GATEWAY_SECRET` | MineAI gateway credential |
 
