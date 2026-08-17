@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           # Matches the deploy target (Ubuntu 24.04 system python3) and the
           # upstream Dockerfile (python:3.12-slim).
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: shellcheck deploy/*.sh deploy/scripts/*.sh
       - run: bash -n deploy/*.sh deploy/scripts/*.sh
       - name: Config render test
