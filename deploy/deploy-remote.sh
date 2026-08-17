@@ -8,8 +8,8 @@
 # stdin is KEY=VALUE lines — secrets travel on stdin so they never appear in
 # argv (visible in `ps`) or in a file outside root-owned temp space. Blank
 # lines and #-comments are ignored; values must not contain newlines.
-# Required keys: ARK_AUTH_SECRET, OPENAI_API_KEY, MINEAI_GATEWAY_URL,
-# MINEAI_GATEWAY_SECRET. Optional: ARK_HOST, ARK_PORT.
+# Required keys: ARK_AUTH_SECRET, OPENAI_API_KEY, DO_INFERENCE_API_KEY,
+# MINEAI_GATEWAY_URL, MINEAI_GATEWAY_SECRET. Optional: ARK_HOST, ARK_PORT.
 #
 # Never add `set -x` here: it would leak secret values into the workflow log.
 set -Eeuo pipefail
