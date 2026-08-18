@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — provider rate-limit backoff
+
+A provider 429 that arrives before ANY event has streamed is retried with
+backoff (2s/5s/15s) instead of failing the turn — heavy tool-loop sessions
+on rate-limited serverless inference (mine-capstone#557 CP2) no longer
+surface FAILED turns for transient throttles. A 429 after output has
+streamed still fails honestly (a replayed stream would double-emit), as
+does the fourth strike.
+
 ## Unreleased — MCP servers as first-class tool sources
 
 Ark speaks [Model Context Protocol](https://modelcontextprotocol.io) as a
