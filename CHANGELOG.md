@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — advisory per-session model/effort overrides
+
+Session-create metadata may carry `model` (any provider model id) and
+`effort` (`medium` | `high`). The turn loop resolves them per session: the
+model override replaces the agent's configured model and is echoed in
+usage events/metrics (the effective model, mine-capstone#568); the `high`
+effort preset raises the output budget to 8192 tokens and the tool-loop
+ceiling to 32 iterations — presets only ever RAISE the agent's configured
+budgets. Absent or unknown values fall through to today's behavior exactly
+(ignore-if-absent), so clients that send nothing are unaffected.
+
 ## Unreleased — provider rate-limit backoff
 
 A provider 429 that arrives before ANY event has streamed is retried with

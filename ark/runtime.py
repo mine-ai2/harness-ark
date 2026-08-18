@@ -324,6 +324,37 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
 # fourth strike (or any mid-stream 429) surfaces as the usual RunError.
 RATE_LIMIT_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 5.0, 15.0)
 
+# Advisory per-session effort presets (mine-capstone#557/#568): clients may
+# put `effort: "medium" | "high"` in session-create metadata. `medium` IS
+# the baseline (listed so the accepted vocabulary is explicit); `high` buys
+# deeper work per user turn — a larger output budget and a higher tool-loop
+# ceiling. Presets only ever RAISE the agent's configured budgets (max(),
+# below), and unknown/absent values fall through to the defaults, so a
+# client that sends nothing gets exactly today's behavior.
+EFFORT_PRESETS: dict[str, dict[str, int]] = {
+    "medium": {},
+    "high": {"max_tokens": 8192, "max_iterations": 32},
+}
+
+
+def _session_overrides(
+    conn: sqlite3.Connection, session_id: str, agent: AgentConfig
+) -> tuple[str, dict[str, int]]:
+    """Resolve the session's advisory (model, effort-preset) pair from its
+    create metadata. Model: any non-empty string wins (provider ids are
+    open-ended — OpenRouter routes `vendor/model` strings we can't
+    enumerate); a bad id fails the provider call and surfaces as the usual
+    RunError. Everything else → the agent's configured model. Effort: only
+    the known preset names map; anything else is ignored."""
+    meta = session_metadata(conn, session_id)
+    model = agent.model
+    requested = meta.get("model")
+    if isinstance(requested, str) and requested.strip():
+        model = requested.strip()
+    effort = meta.get("effort")
+    preset = EFFORT_PRESETS.get(effort, {}) if isinstance(effort, str) else {}
+    return model, preset
+
 
 async def run_user_turn(
     *,
@@ -352,8 +383,16 @@ async def run_user_turn(
         base_url=provider_cfg.base_url,
     )
     skills_for_session = loaded_skills(session_id)
+    # Advisory per-session model/effort (mine-capstone#568): overrides come
+    # from session-create metadata; the effort preset only ever raises the
+    # configured budgets. The agent's max_context_tokens override describes
+    # its CONFIGURED model — for a session-overridden model, fall back to
+    # the table.
+    model, effort_preset = _session_overrides(conn, session_id, agent)
+    max_output_tokens = max(agent.max_tokens or 4096, effort_preset.get("max_tokens", 0))
+    max_iterations = max(max_iterations, effort_preset.get("max_iterations", 0))
     context_window = models.context_window_for(
-        agent.model, agent.max_context_tokens
+        model, agent.max_context_tokens if model == agent.model else None
     )
     project = session_project(conn, session_id)
 
@@ -376,11 +415,11 @@ async def run_user_turn(
         while True:
             try:
                 async for evt in provider.stream_turn(
-                    model=agent.model,
+                    model=model,
                     system=system,
                     messages=turn_messages,
                     tools=active,
-                    max_tokens=agent.max_tokens or 4096,
+                    max_tokens=max_output_tokens,
                 ):
                     emitted_any = True
                     if isinstance(evt, TextDelta):
@@ -398,7 +437,7 @@ async def run_user_turn(
                             TurnMetrics(
                                 input_tokens=evt.input_tokens,
                                 output_tokens=evt.output_tokens,
-                                model=evt.model or agent.model,
+                                model=evt.model or model,
                             ),
                         )
                         # Re-emit with the agent's known context_window so the
@@ -406,7 +445,7 @@ async def run_user_turn(
                         yield TurnUsageEvent(
                             input_tokens=evt.input_tokens,
                             output_tokens=evt.output_tokens,
-                            model=evt.model or agent.model,
+                            model=evt.model or model,
                             context_window=context_window,
                         )
                     elif isinstance(evt, AssistantTurnEnd):
