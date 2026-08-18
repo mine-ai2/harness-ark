@@ -319,6 +319,11 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
 # Turn loop
 # ---------------------------------------------------------------------------
 
+# Backoff schedule for provider rate limits (mine-capstone#557): a 429 that
+# arrives before ANY event has streamed is retried after these sleeps; a
+# fourth strike (or any mid-stream 429) surfaces as the usual RunError.
+RATE_LIMIT_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 5.0, 15.0)
+
 
 async def run_user_turn(
     *,
@@ -366,62 +371,80 @@ async def run_user_turn(
         pending_tool_calls: list[ToolCallEvent] = []
         turn_text = ""
 
-        try:
-            async for evt in provider.stream_turn(
-                model=agent.model,
-                system=system,
-                messages=turn_messages,
-                tools=active,
-                max_tokens=agent.max_tokens or 4096,
-            ):
-                if isinstance(evt, TextDelta):
-                    turn_text += evt.text
-                    yield evt
-                elif isinstance(evt, ThinkingDelta):
-                    yield evt
-                elif isinstance(evt, ToolCallEvent):
-                    pending_tool_calls.append(evt)
-                    yield evt
-                elif isinstance(evt, TurnUsageEvent):
-                    append_message(
-                        conn,
-                        session_id,
-                        TurnMetrics(
-                            input_tokens=evt.input_tokens,
-                            output_tokens=evt.output_tokens,
-                            model=evt.model or agent.model,
-                        ),
-                    )
-                    # Re-emit with the agent's known context_window so the
-                    # client can show a percentage.
-                    yield TurnUsageEvent(
-                        input_tokens=evt.input_tokens,
-                        output_tokens=evt.output_tokens,
-                        model=evt.model or agent.model,
-                        context_window=context_window,
-                    )
-                elif isinstance(evt, AssistantTurnEnd):
-                    last_stop_reason = evt.stop_reason
-                    if turn_text:
-                        append_message(conn, session_id, AssistantText(text=turn_text))
-                    for tc in pending_tool_calls:
+        attempt = 0
+        emitted_any = False
+        while True:
+            try:
+                async for evt in provider.stream_turn(
+                    model=agent.model,
+                    system=system,
+                    messages=turn_messages,
+                    tools=active,
+                    max_tokens=agent.max_tokens or 4096,
+                ):
+                    emitted_any = True
+                    if isinstance(evt, TextDelta):
+                        turn_text += evt.text
+                        yield evt
+                    elif isinstance(evt, ThinkingDelta):
+                        yield evt
+                    elif isinstance(evt, ToolCallEvent):
+                        pending_tool_calls.append(evt)
+                        yield evt
+                    elif isinstance(evt, TurnUsageEvent):
                         append_message(
                             conn,
                             session_id,
-                            ToolCall(
-                                id=tc.id,
-                                name=tc.name,
-                                input=tc.input,
-                                thought_signature=tc.thought_signature,
+                            TurnMetrics(
+                                input_tokens=evt.input_tokens,
+                                output_tokens=evt.output_tokens,
+                                model=evt.model or agent.model,
                             ),
                         )
-                    yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
-        except Exception as exc:  # noqa: BLE001
-            code, message = classify_provider_error(exc)
-            append_message(conn, session_id, RunError(code=code, message=message))
-            yield RunErrorEvent(code=code, message=message)
-            yield RunEnd(stop_reason=f"error:{code}")
-            return
+                        # Re-emit with the agent's known context_window so the
+                        # client can show a percentage.
+                        yield TurnUsageEvent(
+                            input_tokens=evt.input_tokens,
+                            output_tokens=evt.output_tokens,
+                            model=evt.model or agent.model,
+                            context_window=context_window,
+                        )
+                    elif isinstance(evt, AssistantTurnEnd):
+                        last_stop_reason = evt.stop_reason
+                        if turn_text:
+                            append_message(conn, session_id, AssistantText(text=turn_text))
+                        for tc in pending_tool_calls:
+                            append_message(
+                                conn,
+                                session_id,
+                                ToolCall(
+                                    id=tc.id,
+                                    name=tc.name,
+                                    input=tc.input,
+                                    thought_signature=tc.thought_signature,
+                                ),
+                            )
+                        yield AssistantTurnEnd(text=turn_text, stop_reason=evt.stop_reason)
+                break
+            except Exception as exc:  # noqa: BLE001
+                code, message = classify_provider_error(exc)
+                if (
+                    code == "rate_limit"
+                    and not emitted_any
+                    and attempt < len(RATE_LIMIT_BACKOFF_SECONDS)
+                ):
+                    # Provider throttled before anything reached the client
+                    # (mine-capstone#557 CP2: DO serverless 429s were failing
+                    # whole turns): absorb with backoff instead of surfacing
+                    # an error. Never retried once output has streamed — a
+                    # replayed stream would double-emit to the client.
+                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SECONDS[attempt])
+                    attempt += 1
+                    continue
+                append_message(conn, session_id, RunError(code=code, message=message))
+                yield RunErrorEvent(code=code, message=message)
+                yield RunEnd(stop_reason=f"error:{code}")
+                return
 
         if not pending_tool_calls:
             yield RunEnd(stop_reason=last_stop_reason)

@@ -187,6 +187,112 @@ async def test_turn_metrics_filtered_from_llm_list(ark_home, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_before_output_retries_then_succeeds(
+    ark_home, tmp_path, monkeypatch
+):
+    """mine-capstone#557 CP2: a 429 at turn start is absorbed with backoff,
+    not surfaced — the turn completes as if the throttle never happened."""
+    monkeypatch.setattr(runtime, "RATE_LIMIT_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    cfg = make_config(tmp_path)
+    conn = db.init_db()
+    sid = runtime.create_session(conn, "scribe", "conversational")
+    calls = {"n": 0}
+
+    class _ThrottledProvider:
+        async def stream_turn(self, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("429 too many requests")
+            from ark.types import TextDelta
+
+            yield TextDelta(text="finally")
+            yield AssistantTurnEnd(text="finally", stop_reason="end_turn")
+
+    events = []
+    async for evt in runtime.run_user_turn(
+        conn=conn,
+        config=cfg,
+        agent=cfg.agents["scribe"],
+        session_id=sid,
+        user_text="hi",
+        provider_factory=lambda *_a, **_k: _ThrottledProvider(),
+    ):
+        events.append(evt)
+
+    assert calls["n"] == 3
+    assert not any(isinstance(e, RunErrorEvent) for e in events)
+    ends = [e for e in events if isinstance(e, AssistantTurnEnd)]
+    assert ends and ends[0].text == "finally"
+    history = runtime.load_history(conn, sid)
+    assert not any(isinstance(m, RunError) for m in history)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_budget_exhausted_surfaces_error(
+    ark_home, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(runtime, "RATE_LIMIT_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    cfg = make_config(tmp_path)
+    conn = db.init_db()
+    sid = runtime.create_session(conn, "scribe", "conversational")
+    calls = {"n": 0}
+
+    class _AlwaysThrottled:
+        async def stream_turn(self, **_kwargs):
+            calls["n"] += 1
+            raise RuntimeError("429 too many requests")
+            yield  # unreachable — makes this an async generator
+
+    events = []
+    async for evt in runtime.run_user_turn(
+        conn=conn,
+        config=cfg,
+        agent=cfg.agents["scribe"],
+        session_id=sid,
+        user_text="hi",
+        provider_factory=lambda *_a, **_k: _AlwaysThrottled(),
+    ):
+        events.append(evt)
+
+    assert calls["n"] == 4  # initial + the full backoff schedule
+    errs = [e for e in events if isinstance(e, RunErrorEvent)]
+    assert len(errs) == 1 and errs[0].code == "rate_limit"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_after_output_never_retries(ark_home, tmp_path, monkeypatch):
+    """Once anything streamed, a retry would double-emit — fail honestly."""
+    monkeypatch.setattr(runtime, "RATE_LIMIT_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    cfg = make_config(tmp_path)
+    conn = db.init_db()
+    sid = runtime.create_session(conn, "scribe", "conversational")
+    calls = {"n": 0}
+
+    class _MidStreamThrottle:
+        async def stream_turn(self, **_kwargs):
+            calls["n"] += 1
+            from ark.types import TextDelta
+
+            yield TextDelta(text="partial ")
+            raise RuntimeError("429 too many requests")
+
+    events = []
+    async for evt in runtime.run_user_turn(
+        conn=conn,
+        config=cfg,
+        agent=cfg.agents["scribe"],
+        session_id=sid,
+        user_text="hi",
+        provider_factory=lambda *_a, **_k: _MidStreamThrottle(),
+    ):
+        events.append(evt)
+
+    assert calls["n"] == 1
+    errs = [e for e in events if isinstance(e, RunErrorEvent)]
+    assert len(errs) == 1 and errs[0].code == "rate_limit"
+
+
+@pytest.mark.asyncio
 async def test_provider_exception_caught_classified_and_persisted(ark_home, tmp_path):
     cfg = make_config(tmp_path)
     conn = db.init_db()
