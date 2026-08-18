@@ -67,7 +67,7 @@ jobs:
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
           ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DO_INFERENCE_API_KEY: ${{ secrets.DO_INFERENCE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MINEAI_GATEWAY_URL: ${{ secrets.MINEAI_GATEWAY_URL }}
           MINEAI_GATEWAY_SECRET: ${{ secrets.MINEAI_GATEWAY_SECRET }}
         # Secrets travel over stdin: never argv (visible in `ps` on the VM),
@@ -78,7 +78,7 @@ jobs:
           {
             printf '%s=%s\n' ARK_AUTH_SECRET "$ARK_AUTH_SECRET"
             printf '%s=%s\n' OPENAI_API_KEY "$OPENAI_API_KEY"
-            printf '%s=%s\n' DO_INFERENCE_API_KEY "$DO_INFERENCE_API_KEY"
+            printf '%s=%s\n' OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
             printf '%s=%s\n' MINEAI_GATEWAY_URL "$MINEAI_GATEWAY_URL"
             printf '%s=%s\n' MINEAI_GATEWAY_SECRET "$MINEAI_GATEWAY_SECRET"
           } > "$RUNNER_TEMP/deploy.env"
@@ -142,7 +142,7 @@ jobs:
           DEPLOY_USER: ${{ vars.DEPLOY_USER }}
           ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          DO_INFERENCE_API_KEY: ${{ secrets.DO_INFERENCE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MINEAI_GATEWAY_URL: ${{ secrets.MINEAI_GATEWAY_URL }}
           MINEAI_GATEWAY_SECRET: ${{ secrets.MINEAI_GATEWAY_SECRET }}
         run: |
@@ -150,7 +150,7 @@ jobs:
           {
             printf '%s=%s\n' ARK_AUTH_SECRET "$ARK_AUTH_SECRET"
             printf '%s=%s\n' OPENAI_API_KEY "$OPENAI_API_KEY"
-            printf '%s=%s\n' DO_INFERENCE_API_KEY "$DO_INFERENCE_API_KEY"
+            printf '%s=%s\n' OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
             printf '%s=%s\n' MINEAI_GATEWAY_URL "$MINEAI_GATEWAY_URL"
             printf '%s=%s\n' MINEAI_GATEWAY_SECRET "$MINEAI_GATEWAY_SECRET"
           } > "$RUNNER_TEMP/deploy.env"

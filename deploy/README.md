@@ -89,7 +89,7 @@ mountpoint, caddy active) and printing the exact `gh` commands that wire
 the GitHub environment (`SSH_PRIVATE_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`,
 `DEPLOY_DOMAIN`, `SSH_KNOWN_HOSTS`). Five secrets remain operator-supplied:
 `ARK_AUTH_SECRET` (`openssl rand -hex 32`, unique per env), `OPENAI_API_KEY`,
-`DO_INFERENCE_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`.
+`OPENROUTER_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`.
 
 Until the first deploy runs, `https://<domain>/health` returns **502 —
 this is expected**: Caddy is up (cert issuance takes 1–5 min once the DNS
@@ -190,14 +190,14 @@ Then render the config. Variables:
 | `ARK_PORT` | `7777` |
 | `ARK_AUTH_SECRET` | long random string: `openssl rand -hex 32` |
 | `OPENAI_API_KEY` | OpenAI provider key (standby provider) |
-| `DO_INFERENCE_API_KEY` | DigitalOcean inference router key (`providers.do`; talos runs on `kimi-k3`) |
+| `OPENROUTER_API_KEY` | OpenRouter key (`providers.openrouter`; talos runs on `moonshotai/kimi-k3`) |
 | `MINEAI_GATEWAY_URL` | MineAI gateway endpoint (rendered into the `tools.mineai_gateway` passthrough) |
 | `MINEAI_GATEWAY_SECRET` | MineAI gateway credential |
 
 ```sh
 export ARK_HOST=127.0.0.1 ARK_PORT=7777 \
        ARK_AUTH_SECRET="$(openssl rand -hex 32)" OPENAI_API_KEY=sk-... \
-       DO_INFERENCE_API_KEY=... MINEAI_GATEWAY_URL=https://... MINEAI_GATEWAY_SECRET=...
+       OPENROUTER_API_KEY=... MINEAI_GATEWAY_URL=https://... MINEAI_GATEWAY_SECRET=...
 /opt/harness-ark/deploy/render-config.sh > /tmp/config.json
 sudo install -o ark -g ark -m 0600 /tmp/config.json /mnt/harness-data/config.json
 rm /tmp/config.json
@@ -231,7 +231,7 @@ settings → Environments, both with deployment-branch policy `main`:
   already passed the health gate. Pending approvals accumulate one per push;
   approve only the latest.
 
-Per-environment **secrets**: `OPENAI_API_KEY`, `DO_INFERENCE_API_KEY`,
+Per-environment **secrets**: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 `ARK_AUTH_SECRET`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`, `SSH_PRIVATE_KEY` (dedicated
 ed25519 deploy key per environment). Per-environment **variables**:
 `DEPLOY_HOST` (droplet IP — SSH stays independent of DNS health),

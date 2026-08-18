@@ -9,10 +9,9 @@
       "provider_type": "openai",
       "api_key": "${OPENAI_API_KEY}"
     },
-    "do": {
-      "provider_type": "openai",
-      "api_key": "${DO_INFERENCE_API_KEY}",
-      "base_url": "https://inference.do-ai.run/v1"
+    "openrouter": {
+      "provider_type": "openrouter",
+      "api_key": "${OPENROUTER_API_KEY}"
     }
   },
   "tools": {
@@ -23,8 +22,8 @@
   },
   "agents": {
     "talos": {
-      "provider": "do",
-      "model": "kimi-k3",
+      "provider": "openrouter",
+      "model": "moonshotai/kimi-k3",
       "max_context_tokens": 256000,
       "always_loaded_skills": ["mineai_tools"],
       "max_tokens": 8192
