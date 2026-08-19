@@ -292,6 +292,27 @@ any connected WS clients. See [design/design.md §8](../design/design.md) for
 the rationale; the implementation lives in [ark/broker.py](../ark/broker.py)
 and the `post_to_session` tool in [ark/tools.py](../ark/tools.py).
 
+## Advisory model/effort overrides
+
+Two session-create metadata keys get runtime meaning (everything else in
+`metadata` stays opaque, surfaced to skills only):
+
+```json
+{ "metadata": { "model": "moonshotai/kimi-k3", "effort": "high" } }
+```
+
+- `model` — any provider model id; replaces the agent's configured model
+  for this session's turns. The **effective** model is echoed in
+  `turn_usage` events and persisted metrics, so clients always see what
+  actually ran. A bad id fails the provider call and surfaces as the usual
+  run error.
+- `effort` — `medium` (the baseline, explicit no-op) or `high` (output
+  budget raised to 8192 tokens, tool-loop ceiling to 32 iterations).
+  Presets only ever *raise* the agent's configured budgets.
+
+Absent or unrecognized values fall through to the agent's configuration —
+fully backward compatible; clients that send nothing are unaffected.
+
 ## Session metadata + cron fire history
 
 For debugging "what did the cron actually do," two endpoints + two CLI
