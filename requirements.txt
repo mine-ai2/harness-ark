@@ -11,5 +11,11 @@ httpx>=0.27
 watchdog>=4.0  # cross-platform filesystem watcher for project file change events
 mcp>=1.0  # Model Context Protocol client for connecting to external MCP servers
 websockets>=13.0
+# Document generation (mine-capstone#602): pure-Python wheels so `run_command`
+# can produce real PPTX/XLSX/PDF artifacts and share them with the client.
+python-pptx>=0.6.23
+openpyxl>=3.1
+pypdf>=4.0
+reportlab>=4.2
 pytest>=8.0
 pytest-asyncio>=0.23

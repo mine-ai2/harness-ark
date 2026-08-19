@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — one file root for project sessions + document libraries
+
+Tool execution in a **project-bound session** now runs in the PROJECT ROOT
+instead of the agent workspace (mine-capstone#602). That is the root uploads
+already land in and the root every MineAI surface reads — `workspace_files.*`,
+the files panel, the download proxy — so `write_file`/`read_file`/
+`run_command` finally agree with what the user can see. Unbound sessions are
+unchanged (agent workspace).
+
+`share_with_client` resolves against the same root for bound sessions and
+publishes a PROJECT-ROOT-relative path, which is exactly what the MineAI
+download proxy feeds to `read_project_file` — the shared-file → download
+round trip returned 404 for every project session before this. The other root
+is tried as a fallback, so paths produced under the old behavior still share
+successfully.
+
+`python-pptx`, `openpyxl`, `pypdf`, and `reportlab` join `requirements.txt`
+(pure-Python wheels) so agents can generate real PPTX/XLSX/PDF artifacts with
+`run_command` and hand them over with `share_with_client`. Talos's
+`session_context.md` documents the project-root file home, the document
+libraries, and the verbatim-`embed_block` norm.
+
 ## Unreleased — advisory per-session model/effort overrides
 
 Session-create metadata may carry `model` (any provider model id) and
