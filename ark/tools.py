@@ -772,19 +772,52 @@ def _list_uploads() -> str:
     return "\n".join(lines)
 
 
+def _shared_file_roots(ctx: "ToolContext") -> list[tuple[str, Path]]:
+    """Roots `share_with_client` resolves against, in preference order.
+
+    Project-bound sessions publish PROJECT-ROOT-relative paths — that is the
+    root the MineAI download proxy reads for bound sessions, and the root
+    uploads and the file tools now use (mine-capstone#602). The other root is
+    kept as a fallback so paths written before the cwd fix (or by a model
+    still reaching into the agent workspace) still resolve instead of 404ing
+    downstream.
+    """
+
+    from . import runtime
+
+    proj = runtime.session_project(ctx.conn, ctx.session_id)
+    workspace = ("workspace", ctx.agent.workspace)
+    if proj is None:
+        return [workspace]
+    return [("project", Path(proj.root)), workspace]
+
+
 def _share_with_client(*, path: str, description: str = "") -> str:
     from . import broker, runtime, workspace as ws
     from .types import SharedFile
 
     ctx = current_context()
-    try:
-        full = ws.resolve(ctx.agent.workspace, path)
-    except ws.WorkspaceError as e:
-        raise ToolError(str(e))
-    if not full.is_file():
-        raise ToolError(f"not a file: {path}")
+    roots = _shared_file_roots(ctx)
+    full = base = None
+    path_error: str | None = None
+    resolved_any = False
+    for _kind, root in roots:
+        try:
+            candidate = ws.resolve(root, path)
+        except ws.WorkspaceError as e:
+            if path_error is None:
+                path_error = str(e)
+            continue
+        resolved_any = True
+        if candidate.is_file():
+            full, base = candidate, root
+            break
+    if full is None or base is None:
+        # Traversal/absolute paths escape every root — report that, not a
+        # misleading "missing file".
+        raise ToolError(path_error if not resolved_any and path_error else f"not a file: {path}")
 
-    rel = ws.relative_to_workspace(ctx.agent.workspace, full)
+    rel = ws.relative_to_workspace(base, full)
     size = full.stat().st_size
     runtime.append_message(
         ctx.conn, ctx.session_id, SharedFile(path=rel, description=description, size=size)
@@ -815,7 +848,7 @@ _register(
 _register(
     ToolSchema(
         name="share_with_client",
-        description="Make a file in this agent's workspace available to the user. The file appears in their UI as a downloadable artifact. `path` is workspace-relative; `description` is an optional short note shown alongside.",
+        description="Make a file you produced available to the user. The file appears in their UI as a downloadable artifact. `path` is relative to your current working directory (the project root in a project session, your agent workspace otherwise); `description` is an optional short note shown alongside.",
         input_schema={
             "type": "object",
             "properties": {

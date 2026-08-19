@@ -7,6 +7,7 @@ import json
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import AsyncIterator
 
 from dataclasses import asdict, is_dataclass
@@ -489,12 +490,18 @@ async def run_user_turn(
             yield RunEnd(stop_reason=last_stop_reason)
             return
 
+        # File tools run where the session's files actually live
+        # (mine-capstone#602): project-bound sessions share the project tree
+        # — the same root uploads land in, `workspace_files.*` reads, and the
+        # MineAI download proxy serves. Unbound sessions keep the agent
+        # workspace. Without this, read_file/write_file/run_command wrote to a
+        # directory no client surface could see.
         ctx = tools.ToolContext(
             conn=conn,
             config=config,
             agent=agent,
             session_id=session_id,
-            cwd=agent.workspace,
+            cwd=Path(project.root) if project is not None else agent.workspace,
             loaded_skills=skills_for_session,
             metadata=session_metadata(conn, session_id),
         )
