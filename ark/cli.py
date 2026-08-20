@@ -652,6 +652,61 @@ def cmd_cron_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_session_set_project(args: argparse.Namespace) -> int:
+    """Reassign (or detach) a session's project binding."""
+    base_url, secret = _client_settings()
+    sid = args.session_id
+    headers = _headers(secret)
+
+    # Resolve agent from session metadata (avoids requiring --agent).
+    meta_r = httpx.get(
+        f"{base_url}/sessions/{sid}", headers=headers, timeout=10
+    )
+    if meta_r.status_code == 404:
+        print(f"error: session {sid} not found", file=sys.stderr)
+        return 2
+    meta_r.raise_for_status()
+    agent = meta_r.json()["agent_name"]
+
+    project_id: str | None
+    if args.none:
+        project_id = None
+    else:
+        # Accept a project name; look up its id via GET /projects.
+        pl = httpx.get(f"{base_url}/projects", headers=headers, timeout=10)
+        pl.raise_for_status()
+        matches = [p for p in pl.json() if p["name"] == args.project]
+        if not matches:
+            print(f"error: no project named '{args.project}'", file=sys.stderr)
+            return 2
+        project_id = matches[0]["id"]
+
+    r = httpx.patch(
+        f"{base_url}/agents/{agent}/sessions/{sid}/project",
+        headers=headers,
+        json={"project_id": project_id},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        print(f"error: {r.status_code} {r.text}", file=sys.stderr)
+        return 2
+    result = r.json()
+    if not result.get("changed"):
+        print("no change — session is already assigned as requested")
+        return 0
+
+    def _label(p):
+        if p is None:
+            return "(no project)"
+        return f"{p['name']} [{p['id']}]"
+
+    print(
+        f"reassigned session {sid}: "
+        f"{_label(result.get('from'))} → {_label(result.get('to'))}"
+    )
+    return 0
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     """Pretty-print a session transcript. Works for any session kind."""
     base_url, secret = _client_settings()
@@ -852,5 +907,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     show.add_argument("session_id")
     show.set_defaults(func=cmd_show)
+
+    session = sub.add_parser("session", help="manage a session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    set_project = session_sub.add_parser(
+        "set-project",
+        help="reassign or detach a session's project binding",
+    )
+    set_project.add_argument("session_id")
+    grp = set_project.add_mutually_exclusive_group(required=True)
+    grp.add_argument("project", nargs="?", help="project name to assign")
+    grp.add_argument(
+        "--none", action="store_true", help="detach the session from any project"
+    )
+    set_project.set_defaults(func=cmd_session_set_project)
 
     return parser

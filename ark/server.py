@@ -296,6 +296,74 @@ def create_app(config: Config) -> FastAPI:
         runtime.delete_session(conn, sid)
         return {"ok": True}
 
+    @app.patch("/agents/{name}/sessions/{sid}/project")
+    async def set_session_project_endpoint(name: str, sid: str, request: Request):
+        """Reassign or detach a session's project binding.
+
+        Body: `{"project_id": "<uuid>" | null}`
+        - non-null → reassign to that project (or no-op if already there)
+        - null → detach
+
+        Persists a ProjectAssignmentChanged marker in history (the LLM sees a
+        synthetic notification of the transition on the next turn); publishes
+        a `session_project_changed` event so file-browser UIs can refresh.
+
+        Guards: 404 unknown agent/session/project (or soft-deleted target);
+        409 if the session has pending tool calls. Idempotent no-op returns
+        200 with `{"ok": true, "changed": false}`.
+        """
+        if name not in config.agents:
+            raise HTTPException(404, "unknown agent")
+        if not runtime.session_exists(conn, sid, name):
+            raise HTTPException(404, "unknown session")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "expected JSON body")
+        if not isinstance(body, dict) or "project_id" not in body:
+            raise HTTPException(400, "body must be an object with a 'project_id' field")
+        new_project_id = body["project_id"]
+        if new_project_id is not None and not isinstance(new_project_id, str):
+            raise HTTPException(400, "'project_id' must be a string or null")
+        if new_project_id is not None:
+            target = projects.get(conn, new_project_id)
+            if target is None or target.deleted_at is not None:
+                raise HTTPException(404, "unknown project")
+        if runtime.has_pending_tool_calls(runtime.load_history(conn, sid)):
+            raise HTTPException(
+                409, "session has unmatched tool calls — wait for the turn to complete"
+            )
+
+        result = runtime.set_session_project(conn, sid, new_project_id)
+        if result is None:
+            return {"ok": True, "changed": False}
+        from_p, to_p = result
+
+        def _proj_dict(p):
+            if p is None:
+                return None
+            return {"id": p.id, "name": p.name, "root": p.root}
+
+        broker.publish(
+            sid,
+            {
+                "type": "session_project_changed",
+                "session_id": sid,
+                "agent_name": name,
+                "from_project_id": from_p.id if from_p else None,
+                "from_project_name": from_p.name if from_p else None,
+                "to_project_id": to_p.id if to_p else None,
+                "to_project_name": to_p.name if to_p else None,
+                "changed_at": runtime.now_ms(),
+            },
+        )
+        return {
+            "ok": True,
+            "changed": True,
+            "from": _proj_dict(from_p),
+            "to": _proj_dict(to_p),
+        }
+
     @app.post("/agents/{name}/sessions/{sid}/compact")
     async def compact_session_endpoint(name: str, sid: str, request: Request):
         """Manually trigger compaction for a session.

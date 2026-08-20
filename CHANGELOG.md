@@ -1,5 +1,98 @@
 # Changelog
 
+## Unreleased — Mutable session ↔ project binding
+
+Session-to-project assignment was previously immutable. It's now mutable
+via a dedicated endpoint, and the LLM is explicitly notified of the
+transition on the next turn so it doesn't silently start seeing a
+different project's environment.
+
+### New REST endpoint
+
+```
+PATCH /agents/{name}/sessions/{sid}/project
+Body: { "project_id": "<uuid>" }   # reassign or first-time assign
+      { "project_id": null }         # detach
+
+200: { "ok": true, "changed": true, "from": {id,name,root}|null, "to": {id,name,root}|null }
+200: { "ok": true, "changed": false }        # no-op (already assigned as requested)
+404: unknown agent, session, or project (soft-deleted target counts as unknown)
+409: session has unmatched tool calls
+400: body missing 'project_id', or wrong type
+```
+
+Idempotent: PATCHing to the current binding returns `{"changed": false}`
+without writing a marker or publishing an event.
+
+### New message kind: `ProjectAssignmentChanged`
+
+Persisted in history on every real change (skipped on no-ops). Fields:
+`from_project_id`, `to_project_id`, `from_project_name`, `to_project_name`,
+`from_root`, `to_root`, `changed_at`. Both endpoints can be null (detach /
+first-time-assign). `GET /history` returns it so clients can render a
+timeline divider; the runtime substitutes it with a synthetic `UserText`
+notification when building the LLM's message list so the model sees the
+transition as an event at that point in the conversation (previous
+project → new project + a note that prior file references are
+historical).
+
+### New WS event
+
+`session_project_changed` on `/events`:
+
+```json
+{
+  "type": "session_project_changed",
+  "session_id": "...", "agent_name": "...",
+  "from_project_id": "...", "from_project_name": "...",
+  "to_project_id": "...", "to_project_name": "...",
+  "changed_at": 1755600000000
+}
+```
+
+Only fires on real changes — no-op PATCHes are silent.
+
+### New CLI
+
+```
+ark session set-project <sid> <project-name>     # reassign
+ark session set-project <sid> --none              # detach
+```
+
+Auto-resolves the session's owning agent from `GET /sessions/{sid}` so the
+user doesn't have to specify `--agent`.
+
+### Runtime changes
+
+- New helper `runtime.set_session_project(conn, sid, new_project_id)` —
+  updates `sessions.project_id` and appends the marker in one call.
+  Returns `(from_project, to_project)` or `None` for no-op.
+- New helper `runtime._rewrite_for_llm(messages)` — pre-provider
+  substitution pass; currently only rewrites `ProjectAssignmentChanged`
+  markers to their `UserText` notification form. `run_user_turn` and
+  `compact_session` both use it.
+- No DB schema change (`content_json` handles the new kind natively).
+
+### Sharp edges
+
+- **Old uploads become invisible via `list_uploads`** after reassignment
+  — files still exist under the old project's `uploads/`, but the current
+  session's tool sees only the new project's dir. The transition
+  notification explicitly warns about historical references.
+- **Compaction across a reassignment** relies on the summarizer preserving
+  the transition. The default prompt asks for that; if it drops in
+  practice, clients can pre-supply a summary via `POST .../compact`.
+- **Per-agent access control isn't added here** — any client with the
+  bearer token can reassign any session to any project. If per-agent /
+  per-user gating is needed, that's a separate authz layer.
+
+### Docs
+
+- [docs/projects.md](docs/projects.md) — new "Reassigning a session's
+  project" section. Removed the "binding is immutable" language.
+- [docs/sessions.md](docs/sessions.md) — event table + history kinds
+  updated.
+
 ## Unreleased — Manual session compaction
 
 Client-invoked companion to automatic compaction. Same underlying mechanism

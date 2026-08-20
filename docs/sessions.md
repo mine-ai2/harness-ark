@@ -49,7 +49,7 @@ GET /agents/{name}/sessions/{sid}/history
 Returns every message in the session, ordered chronologically. `kind` is the
 class name of the message (`UserText`, `AssistantText`, `ToolCall`,
 `ToolResult`, `UploadMessage`, `SharedFile`, `SessionContext`,
-`CompactionSummary`).
+`CompactionSummary`, `ProjectAssignmentChanged`).
 
 ### Delete a session
 
@@ -170,6 +170,7 @@ right session.
 | `compaction_completed` | `summary`, `reason` | Summary persisted; subsequent turns use it |
 | `compaction_failed` | `code`, `message`, `reason` | Summarizer call errored |
 | `compaction_skipped` | `reason`, `input_tokens`, `context_window` | Threshold crossed but compaction is disabled — warning-only, no action taken |
+| `session_project_changed` | `from_project_id`, `from_project_name`, `to_project_id`, `to_project_name`, `changed_at` | A session's project binding changed (see [projects.md § Reassigning a session's project](projects.md#reassigning-a-sessions-project)) |
 | `done` | `stop_reason` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
 
 Every event also carries `session_id` and (except for the broad "error" case

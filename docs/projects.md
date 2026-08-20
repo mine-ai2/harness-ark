@@ -111,8 +111,8 @@ POST /agents/{name}/sessions
 }
 ```
 
-The binding is **immutable for the life of the session** — to operate in a
-different project, start a new session.
+The binding can be changed at any time via `PATCH .../project` (see
+[Reassigning a session's project](#reassigning-a-sessions-project) below).
 
 When a session is in a project, the runtime adjusts three things:
 
@@ -142,6 +142,70 @@ When a session is in a project, the runtime adjusts three things:
    workspace — by design, for predictability. The agent uses absolute paths
    for project file ops, and that's what the system prompt directs it to
    do.
+
+## Reassigning a session's project
+
+The project binding is mutable. A session can be attached to a project,
+moved to a different one, or detached entirely.
+
+```
+PATCH /agents/{name}/sessions/{sid}/project
+Body: { "project_id": "<uuid>" }     # reassign (or first-time assign)
+      { "project_id": null }          # detach
+
+200: { "ok": true, "changed": true, "from": {id,name,root}|null, "to": {id,name,root}|null }
+200: { "ok": true, "changed": false }         # no-op (already assigned as requested)
+404: unknown agent, session, or project (soft-deleted target counts as unknown)
+409: session has unmatched tool calls — wait for the turn to complete
+400: body missing 'project_id', or project_id is not a string or null
+```
+
+On a real change (`changed: true`), two things happen:
+
+1. **A `ProjectAssignmentChanged` marker is persisted** in the session's
+   history. `GET /history` returns it so clients can render a "── Project
+   changed to Y ──" divider in the transcript. Its payload records
+   `from_project_*` and `to_project_*` (id, name, root) plus `changed_at`.
+   Successive reassignments produce successive markers — an ordered
+   assignment history.
+2. **A `session_project_changed` event is published** on `/events` so file
+   browsers and other live UIs can refresh. Payload mirrors the marker.
+
+On the **next turn**, the runtime substitutes the marker with a synthetic
+`UserText` notification in the message list — the LLM sees an explicit
+event describing the transition (previous project, new project, and a
+reminder that prior file references are historical context). The system
+prompt's "Project" stanza automatically reflects the new binding. Nothing
+about the old project's context or `project_context` carries forward.
+
+**No-op semantics.** If the requested `project_id` equals the current one,
+the endpoint returns `{"changed": false}` and does not write a marker or
+publish an event — clients that don't want to check-before-set can PATCH
+idempotently.
+
+**Uploads before/after the change.** Files uploaded while the session was
+in project A live under `/projects/A/uploads/`. After reassignment to
+project B, `list_uploads` (agent tool + REST) reflects project B's dir —
+the old uploads still exist on disk but are no longer surfaced to the
+agent through `list_uploads`. The transition notification in the LLM
+message list explicitly warns that references to prior project files are
+historical.
+
+**Compaction interaction.** The default summarizer prompt already
+preserves significant events, so a compaction that spans a reassignment
+should carry the transition forward in its summary. If it doesn't in
+practice, the client can pre-supply a summary via `POST .../compact` that
+includes the reassignment context.
+
+### CLI
+
+```
+ark session set-project <sid> <project-name>     # reassign to that project by name
+ark session set-project <sid> --none              # detach
+```
+
+The command resolves the session's owning agent from its metadata and
+looks up the project id by name via `GET /projects`.
 
 ## Agent tools
 

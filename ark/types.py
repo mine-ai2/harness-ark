@@ -124,6 +124,28 @@ class RunError:
 
 
 @dataclass
+class ProjectAssignmentChanged:
+    """Marker persisted at the moment a session's project assignment changes.
+
+    Both endpoints are nullable: `to_project_id=None` means the session was
+    detached from a project; `from_project_id=None` means it had no project
+    before. Persisted for audit + client-side rendering; substituted for a
+    synthetic UserText when the runtime builds the LLM's message list so the
+    model sees the transition as an event at that point in the timeline.
+
+    Once written, this row is immutable — subsequent reassignments produce
+    new rows, giving an ordered assignment-history."""
+
+    from_project_id: str | None
+    to_project_id: str | None
+    from_project_name: str | None = None
+    to_project_name: str | None = None
+    from_root: str | None = None
+    to_root: str | None = None
+    changed_at: int = 0
+
+
+@dataclass
 class CompactionSummary:
     """A summary of prior conversation, folded into the system prompt from
     this row's position forward.
@@ -153,6 +175,7 @@ Message = Union[
     TurnMetrics,
     RunError,
     CompactionSummary,
+    ProjectAssignmentChanged,
 ]
 
 
@@ -346,6 +369,16 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
         return "run_error", {"code": msg.code, "message": msg.message}
     if isinstance(msg, CompactionSummary):
         return "compaction_summary", {"text": msg.text, "reason": msg.reason}
+    if isinstance(msg, ProjectAssignmentChanged):
+        return "project_assignment_changed", {
+            "from_project_id": msg.from_project_id,
+            "to_project_id": msg.to_project_id,
+            "from_project_name": msg.from_project_name,
+            "to_project_name": msg.to_project_name,
+            "from_root": msg.from_root,
+            "to_root": msg.to_root,
+            "changed_at": msg.changed_at,
+        }
     raise TypeError(f"unknown message type: {type(msg).__name__}")
 
 
@@ -395,5 +428,15 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
     if role == "compaction_summary":
         return CompactionSummary(
             text=content.get("text", ""), reason=content.get("reason", "")
+        )
+    if role == "project_assignment_changed":
+        return ProjectAssignmentChanged(
+            from_project_id=content.get("from_project_id"),
+            to_project_id=content.get("to_project_id"),
+            from_project_name=content.get("from_project_name"),
+            to_project_name=content.get("to_project_name"),
+            from_root=content.get("from_root"),
+            to_root=content.get("to_root"),
+            changed_at=int(content.get("changed_at", 0)),
         )
     raise ValueError(f"unknown role: {role}")

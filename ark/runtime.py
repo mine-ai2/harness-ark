@@ -23,6 +23,7 @@ from .types import (
     CompactionSummary,
     Message,
     Project,
+    ProjectAssignmentChanged,
     RunEnd,
     RunError,
     RunErrorEvent,
@@ -269,6 +270,57 @@ def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
     ).fetchone()[0]
 
 
+def set_session_project(
+    conn: sqlite3.Connection,
+    session_id: str,
+    new_project_id: str | None,
+) -> tuple[Project | None, Project | None] | None:
+    """Change a session's project binding. Returns (from_project, to_project)
+    on a real change, or None when the assignment is unchanged (idempotent
+    no-op — caller can treat as success without emitting a marker).
+
+    Also appends a `ProjectAssignmentChanged` marker to session history so
+    the next turn's LLM message list shows the transition, and clients can
+    render a "project changed" divider in the timeline.
+
+    Callers should have already validated: session exists, agent owns it,
+    the new project exists and is not soft-deleted, and no pending tool
+    calls in history."""
+
+    row = conn.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"session {session_id} not found")
+    current_project_id: str | None = row["project_id"]
+    if current_project_id == new_project_id:
+        return None  # idempotent no-op
+
+    from_project = (
+        projects.get(conn, current_project_id) if current_project_id else None
+    )
+    to_project = projects.get(conn, new_project_id) if new_project_id else None
+
+    conn.execute(
+        "UPDATE sessions SET project_id = ? WHERE id = ?",
+        (new_project_id, session_id),
+    )
+    append_message(
+        conn,
+        session_id,
+        ProjectAssignmentChanged(
+            from_project_id=current_project_id,
+            to_project_id=new_project_id,
+            from_project_name=from_project.name if from_project else None,
+            to_project_name=to_project.name if to_project else None,
+            from_root=from_project.root if from_project else None,
+            to_root=to_project.root if to_project else None,
+            changed_at=now_ms(),
+        ),
+    )
+    return from_project, to_project
+
+
 def classify_provider_error(exc: Exception) -> tuple[str, str]:
     """Map a provider exception to (code, message) for client surfacing.
 
@@ -336,12 +388,48 @@ Be complete over concise. The assistant will rely on this summary as its only me
 _LLM_EXCLUDED = (SessionContext, TurnMetrics, RunError, CompactionSummary)
 
 
+def _rewrite_for_llm(messages: list[Message]) -> list[Message]:
+    """Apply per-kind rewrites needed before a message list goes to a provider.
+
+    Currently: substitute ProjectAssignmentChanged markers with synthetic
+    UserText notifications so the model sees the transition as an event at
+    that point in the timeline. (The original marker stays in history for
+    audit + client rendering.)"""
+    out: list[Message] = []
+    for m in messages:
+        if isinstance(m, ProjectAssignmentChanged):
+            out.append(UserText(text=_project_change_notification(m)))
+        else:
+            out.append(m)
+    return out
+
+
 def _latest_compaction(history: list[Message]) -> tuple[int, CompactionSummary] | None:
     """Return (index, msg) of the latest CompactionSummary in history, or None."""
     for i in range(len(history) - 1, -1, -1):
         if isinstance(history[i], CompactionSummary):
             return i, history[i]
     return None
+
+
+def _project_change_notification(msg: ProjectAssignmentChanged) -> str:
+    """Render a ProjectAssignmentChanged marker as the notification the LLM
+    sees in the message list. Explicit about historicity so the model doesn't
+    treat prior file references as still-in-scope."""
+
+    def _describe(name: str | None, root: str | None) -> str:
+        if name is None and root is None:
+            return "no project assignment"
+        return f"'{name or '(unnamed)'}' at {root or '(unknown path)'}"
+
+    return (
+        "[system notification: This session's project assignment changed.\n"
+        f"Previously: {_describe(msg.from_project_name, msg.from_root)}\n"
+        f"Now: {_describe(msg.to_project_name, msg.to_root)}\n"
+        "Continue helping the user. References to files under the previous "
+        "project are historical context, not the current working area. "
+        "Uploads and project-scoped operations now target the new location.]"
+    )
 
 
 def has_pending_tool_calls(history: list[Message]) -> bool:
@@ -431,9 +519,9 @@ async def compact_session(
 
     # Post-slice content that will be summarized. Also strip LLM-invisible kinds
     # so the summarizer doesn't waste tokens on telemetry rows.
-    to_summarize: list[Message] = [
-        m for m in history[slice_idx:] if not isinstance(m, _LLM_EXCLUDED)
-    ]
+    to_summarize: list[Message] = _rewrite_for_llm(
+        [m for m in history[slice_idx:] if not isinstance(m, _LLM_EXCLUDED)]
+    )
     if exclude_last > 0:
         to_summarize = to_summarize[:-exclude_last]
 
@@ -579,7 +667,9 @@ async def run_user_turn(
             slice_history = history[latest[0] + 1:]
         else:
             slice_history = history
-        turn_messages = [m for m in slice_history if not isinstance(m, _LLM_EXCLUDED)]
+        turn_messages = _rewrite_for_llm(
+            [m for m in slice_history if not isinstance(m, _LLM_EXCLUDED)]
+        )
         system = system_prompt(
             agent, contexts, project=project, compaction_summary=compaction_text
         )
