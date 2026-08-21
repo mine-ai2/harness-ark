@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — share_with_client no longer poisons the conversation
+
+`share_with_client` appends its `SharedFile` row from inside the tool call,
+so it landed BETWEEN the assistant's `ToolCall` and the `ToolResult` the turn
+loop appends after it. The provider folders group a contiguous
+`(AssistantText | ToolCall | SharedFile)` run into one assistant message, so
+the first `SharedFile` of a turn was absorbed harmlessly but every one after
+it opened a NEW assistant message between the tool calls and their results —
+emitting a `tool` message with no preceding assistant tool call. Two shares
+in one turn was enough. History is durable, so once a turn did this EVERY
+later turn re-sent the malformed array and the session could never recover.
+
+Seen twice in production on two providers: Kimi K3 `400 "tool messages need a
+tool/name or a preceding assistant tool call"` and Gemini `"The model request
+was rejected"`. `SharedFile` now joins `_llm_excluded` — the client still gets
+its artifact rows, and the model still learns about the file from the tool's
+own result string (`shared <path> with the client (<n> bytes)`).
+
+`classify_provider_error` gains a **`bad_request`** code for "we sent
+something the model would not accept" — distinct from a transient failure
+because retrying identical input can never help. It is matched after
+`rate_limit`/`auth` so those keep their specific codes. Error messages are
+also unwrapped from the provider's stringified JSON body, so clients surface
+the human sentence instead of `Error code: 400 - {'error': {...}}`.
+
 ## Unreleased — one file root for project sessions + document libraries
 
 Tool execution in a **project-bound session** now runs in the PROJECT ROOT

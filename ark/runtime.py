@@ -24,6 +24,7 @@ from .types import (
     RunError,
     RunErrorEvent,
     RuntimeEvent,
+    SharedFile,
     SessionContext,
     TextDelta,
     ThinkingDelta,
@@ -279,17 +280,55 @@ def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
     ).fetchone()[0]
 
 
+_PROVIDER_MESSAGE_KEYS = ("message", "error_description", "detail")
+
+
+def _readable_provider_message(raw: str) -> str:
+    """Pull the human sentence out of a provider error string.
+
+    Providers stringify their JSON body into the exception (``Error code: 400
+    - {'error': {'message': '...'}}``), so the useful sentence arrives buried
+    in punctuation. Clients were surfacing the whole blob verbatim. Falls
+    back to the raw string whenever nothing parses — never invents text.
+    """
+
+    start = raw.find("{")
+    if start == -1:
+        return raw
+    blob = raw[start:]
+    for candidate in (blob, blob.replace("'", '"')):
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            inner = parsed.get("error")
+            for source in (inner if isinstance(inner, dict) else None, parsed):
+                if not isinstance(source, dict):
+                    continue
+                for key in _PROVIDER_MESSAGE_KEYS:
+                    value = source.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+    return raw
+
+
 def classify_provider_error(exc: Exception) -> tuple[str, str]:
     """Map a provider exception to (code, message) for client surfacing.
 
-    Codes: 'context_too_long' | 'rate_limit' | 'auth' | 'other'. The match is
-    intentionally loose — uses both exception class name and message text so
-    it works across Anthropic, OpenAI, OpenRouter (OpenAI-shaped), and Google
-    without coupling to their import paths.
+    Codes: 'context_too_long' | 'rate_limit' | 'auth' | 'bad_request' |
+    'other'. The match is intentionally loose — uses both exception class
+    name and message text so it works across Anthropic, OpenAI, OpenRouter
+    (OpenAI-shaped), and Google without coupling to their import paths.
+
+    ``bad_request`` is the "we sent something the model would not accept"
+    bucket — a malformed conversation, an unsupported parameter, a rejected
+    tool schema. It is worth its own code because, unlike a rate limit, it is
+    OUR bug and retrying identical input can never help.
     """
 
     name = type(exc).__name__
-    raw = str(exc)
+    raw = _readable_provider_message(str(exc))
     low = raw.lower()
     context_hits = (
         "context_length_exceeded",
@@ -313,6 +352,23 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
         or "invalid_api_key" in low
     ):
         return "auth", raw
+    # Checked AFTER rate_limit/auth so a 429 or 401 keeps its specific code.
+    # Matched on the ORIGINAL string: the readable message rarely repeats the
+    # status code that identifies the class of failure.
+    original = str(exc)
+    original_low = original.lower()
+    if (
+        "BadRequest" in name
+        or "InvalidRequest" in name
+        or "InvalidArgument" in name
+        or "invalid_request" in original_low
+        or "error code: 400" in original_low
+        or '"code":400' in original_low.replace(" ", "")
+        or "'code':400" in original_low.replace(" ", "")
+        or "bad request" in original_low
+        or "request was rejected" in original_low
+    ):
+        return "bad_request", raw
     return "other", raw
 
 
@@ -400,8 +456,27 @@ async def run_user_turn(
     last_stop_reason: str | None = None
     # Message kinds that exist as session-history metadata but must NOT be
     # passed to the LLM as conversation turns (system_prompt material,
-    # telemetry, or recorded errors).
-    _llm_excluded = (SessionContext, TurnMetrics, RunError)
+    # telemetry, recorded errors, or client-artifact records).
+    #
+    # SharedFile is excluded for a correctness reason, not just tidiness
+    # (mine-capstone#602 follow-up). `share_with_client` appends its
+    # SharedFile row from INSIDE tools.execute — i.e. between the assistant's
+    # ToolCall and the ToolResult the turn loop appends after it. The
+    # provider folders group a contiguous run of
+    # (AssistantText | ToolCall | SharedFile) into ONE assistant message, so
+    # the first SharedFile of a turn is absorbed into the tool_calls cluster
+    # harmlessly but every one after it opens a NEW assistant message that
+    # lands between the tool_calls and their results. Two shares in one turn
+    # therefore emit a `tool` message with no preceding assistant tool call,
+    # which strict providers reject outright (observed: Kimi K3 400 "tool
+    # messages need a tool/name or a preceding assistant tool call"; Gemini
+    # "The model request was rejected"). The history is durable, so once a
+    # turn does this EVERY later turn re-sends the malformed array and the
+    # session can never recover.
+    #
+    # Nothing is lost by excluding it: the tool's own ToolResult already
+    # tells the model "shared <path> with the client (<n> bytes)".
+    _llm_excluded = (SessionContext, TurnMetrics, RunError, SharedFile)
     for _ in range(max_iterations):
         history = load_history(conn, session_id)
         contexts = [m for m in history if isinstance(m, SessionContext)]
