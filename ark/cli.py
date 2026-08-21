@@ -567,18 +567,23 @@ def cmd_cron_list(args: argparse.Namespace) -> int:
         return 0
     for c in rows:
         status = "" if c["enabled"] else " [disabled]"
+        # Project attribution (server returns project_id + project_name).
+        proj = ""
+        if c.get("project_id"):
+            pname = c.get("project_name")
+            proj = f" [project={pname}]" if pname else f" [project={c['project_id']} DELETED]"
         prompt = c["prompt"]
         if args.full:
             # Indent multi-line prompts under their header.
             indented = "\n".join("    " + line for line in prompt.splitlines())
-            print(f"{c['id']}: {c['expr']}{status}")
+            print(f"{c['id']}: {c['expr']}{status}{proj}")
             print(indented)
         else:
             # One-line preview. Collapse newlines so we don't break the table.
             preview = " ".join(prompt.split())
             if len(preview) > 100:
                 preview = preview[:100] + "…"
-            print(f"{c['id']}: {c['expr']}{status} — {preview}")
+            print(f"{c['id']}: {c['expr']}{status}{proj} — {preview}")
     return 0
 
 
@@ -588,10 +593,24 @@ def cmd_cron_set(args: argparse.Namespace) -> int:
     if not prompt:
         print("--prompt or --prompt-file is required", file=sys.stderr)
         return 1
+    headers = _headers(secret)
+    body: dict[str, Any] = {"expr": args.expr, "prompt": prompt}
+    # --project resolves a name to id; --no-project explicitly detaches.
+    # Neither flag → server keeps whatever project_id was already set.
+    if args.no_project:
+        body["project_id"] = None
+    elif args.project is not None:
+        pl = httpx.get(f"{base_url}/projects", headers=headers, timeout=10)
+        pl.raise_for_status()
+        matches = [p for p in pl.json() if p["name"] == args.project]
+        if not matches:
+            print(f"error: no project named '{args.project}'", file=sys.stderr)
+            return 2
+        body["project_id"] = matches[0]["id"]
     r = httpx.put(
         f"{base_url}/agents/{args.agent}/crons/{args.id}",
-        headers=_headers(secret),
-        json={"expr": args.expr, "prompt": prompt},
+        headers=headers,
+        json=body,
         timeout=10,
     )
     if r.status_code >= 400:
@@ -886,6 +905,16 @@ def build_parser() -> argparse.ArgumentParser:
     cron_set.add_argument("--prompt", help="inline prompt body")
     cron_set.add_argument(
         "--prompt-file", type=argparse.FileType("r"), help="read prompt from file"
+    )
+    proj_grp = cron_set.add_mutually_exclusive_group()
+    proj_grp.add_argument(
+        "--project",
+        help="bind each fire's session to this project (by name)",
+    )
+    proj_grp.add_argument(
+        "--no-project",
+        action="store_true",
+        help="explicitly detach any project binding on the cron",
     )
     cron_set.set_defaults(func=cmd_cron_set)
 

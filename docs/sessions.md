@@ -475,3 +475,8 @@ conversational sessions via `post_to_session` to surface results to humans.
 
 Adding per-session context to a scheduled session is unusual but works —
 the same REST endpoint accepts any session id regardless of kind.
+
+**Cron entries can also carry a `project_id`**, in which case each fire
+creates a session already bound to that project (system prompt gets the
+project stanza from turn 1, uploads land in the project's dir). See
+[projects.md § Cron entries can be bound to a project](projects.md#cron-entries-can-be-bound-to-a-project).

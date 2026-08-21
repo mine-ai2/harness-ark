@@ -86,7 +86,7 @@ class Scheduler:
 
         # crons
         rows = self.conn.execute(
-            "SELECT agent_name, id, expr, prompt FROM crons WHERE enabled = 1"
+            "SELECT agent_name, id, expr, prompt, project_id FROM crons WHERE enabled = 1"
         ).fetchall()
         now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
         for row in rows:
@@ -104,7 +104,9 @@ class Scheduler:
             if now_dt >= next_dt:
                 self.last_cron[key] = now
                 asyncio.create_task(
-                    self._fire_cron(row["agent_name"], row["id"], row["prompt"])
+                    self._fire_cron(
+                        row["agent_name"], row["id"], row["prompt"], row["project_id"]
+                    )
                 )
 
     def _heartbeat_interval(self, agent_name: str) -> int | None:
@@ -128,8 +130,28 @@ class Scheduler:
         )
         await self._drive(agent_name, "heartbeat", prompt)
 
-    async def _fire_cron(self, agent_name: str, cron_id: str, prompt: str) -> None:
-        await self._drive(agent_name, "cron", prompt, cron_id=cron_id)
+    async def _fire_cron(
+        self, agent_name: str, cron_id: str, prompt: str, project_id: str | None
+    ) -> None:
+        # If the cron was bound to a project that has since been soft-deleted,
+        # warn but still fire — the session just runs project-less. Matches
+        # the "runtime.session_project returns None for deleted" semantics.
+        if project_id is not None:
+            from . import projects as _projects
+
+            p = _projects.get(self.conn, project_id)
+            if p is None or p.deleted_at is not None:
+                print(
+                    f"[scheduler] cron {cron_id!r} for {agent_name}: bound project "
+                    f"{project_id} is deleted, firing in workspace mode",
+                    file=sys.stderr,
+                )
+                # We still pass the id through — the session row records what
+                # the cron was TRYING to bind to (audit). runtime.session_project
+                # returns None so the LLM view is project-less.
+        await self._drive(
+            agent_name, "cron", prompt, cron_id=cron_id, project_id=project_id
+        )
 
     async def _drive(
         self,
@@ -137,12 +159,13 @@ class Scheduler:
         kind: str,
         prompt: str,
         cron_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         agent = self.config.agents.get(agent_name)
         if agent is None:
             return
         sid = runtime.create_session(
-            self.conn, agent_name, kind=kind, cron_id=cron_id
+            self.conn, agent_name, kind=kind, cron_id=cron_id, project_id=project_id
         )
         try:
             # run_and_publish routes events through the broker so connected

@@ -377,7 +377,9 @@ def _set_heartbeat(*, seconds: float | None) -> str:
     return f"heartbeat set to {s}s for {ctx.agent.name}"
 
 
-def _add_cron(*, id: str, expr: str, prompt: str) -> str:
+def _add_cron(
+    *, id: str, expr: str, prompt: str, project_id: str | None = None
+) -> str:
     # Validate cron expression
     try:
         from croniter import croniter
@@ -386,12 +388,26 @@ def _add_cron(*, id: str, expr: str, prompt: str) -> str:
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"invalid cron expression {expr!r}: {e}")
     ctx = current_context()
+    if project_id is not None:
+        from . import projects as _projects
+
+        p = _projects.get(ctx.conn, project_id)
+        if p is None or p.deleted_at is not None:
+            raise ToolError(
+                f"unknown project {project_id!r}. Call list_projects to see "
+                "available projects, or get_current_session_info to use the "
+                "project of the current session."
+            )
     ctx.conn.execute(
-        "INSERT INTO crons(agent_name, id, expr, prompt, enabled) VALUES (?,?,?,?,1) "
-        "ON CONFLICT(agent_name, id) DO UPDATE SET expr=excluded.expr, prompt=excluded.prompt, enabled=1",
-        (ctx.agent.name, id, expr, prompt),
+        "INSERT INTO crons(agent_name, id, expr, prompt, enabled, project_id) "
+        "VALUES (?,?,?,?,1,?) "
+        "ON CONFLICT(agent_name, id) DO UPDATE SET "
+        "expr=excluded.expr, prompt=excluded.prompt, enabled=1, "
+        "project_id=excluded.project_id",
+        (ctx.agent.name, id, expr, prompt, project_id),
     )
-    return f"cron '{id}' set: {expr}"
+    proj_suffix = f" (project={project_id})" if project_id else ""
+    return f"cron '{id}' set: {expr}{proj_suffix}"
 
 
 def _remove_cron(*, id: str) -> str:
@@ -405,14 +421,27 @@ def _remove_cron(*, id: str) -> str:
 
 
 def _list_crons() -> str:
+    from . import projects as _projects
+
     ctx = current_context()
     rows = ctx.conn.execute(
-        "SELECT id, expr, prompt FROM crons WHERE agent_name = ? AND enabled = 1 ORDER BY id",
+        "SELECT id, expr, prompt, project_id "
+        "FROM crons WHERE agent_name = ? AND enabled = 1 ORDER BY id",
         (ctx.agent.name,),
     ).fetchall()
     if not rows:
         return "(no crons)"
-    return "\n".join(f"{r['id']}: {r['expr']} — {r['prompt'][:60]}" for r in rows)
+    lines = []
+    for r in rows:
+        proj_label = ""
+        if r["project_id"]:
+            p = _projects.get(ctx.conn, r["project_id"])
+            if p is not None and p.deleted_at is None:
+                proj_label = f" [project={p.name}]"
+            else:
+                proj_label = f" [project={r['project_id']} DELETED]"
+        lines.append(f"{r['id']}: {r['expr']}{proj_label} — {r['prompt'][:60]}")
+    return "\n".join(lines)
 
 
 _register(
@@ -431,13 +460,26 @@ _register(
 _register(
     ToolSchema(
         name="add_cron",
-        description="Create or update a cron entry for this agent. `expr` is a 5-field UNIX cron expression; `prompt` is the starting message when the cron fires.",
+        description=(
+            "Create or update a cron entry for this agent. `expr` is a 5-field "
+            "UNIX cron expression; `prompt` is the starting message when the "
+            "cron fires. Optional `project_id` binds each fire's session to a "
+            "project (use `list_projects` to see available projects, or "
+            "`get_current_session_info` for the current session's project). "
+            "Omit or pass null for a project-less cron. Bound sessions inherit "
+            "the project's system-prompt stanza from turn 1 and their uploads "
+            "land in the project's uploads dir."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
                 "expr": {"type": "string"},
                 "prompt": {"type": "string"},
+                "project_id": {
+                    "type": ["string", "null"],
+                    "description": "Optional project uuid to bind each fire to.",
+                },
             },
             "required": ["id", "expr", "prompt"],
         },
@@ -629,6 +671,22 @@ def _get_project_info() -> dict | None:
     }
 
 
+def _list_projects() -> list[dict]:
+    """List active projects on the server."""
+    from . import projects as _projects
+
+    ctx = current_context()
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "root": p.root,
+            "description": p.description,
+        }
+        for p in _projects.list_projects(ctx.conn)
+    ]
+
+
 _register(
     ToolSchema(
         name="get_current_time",
@@ -673,6 +731,20 @@ _register(
         input_schema={"type": "object", "properties": {}},
     ),
     _get_project_info,
+)
+
+_register(
+    ToolSchema(
+        name="list_projects",
+        description=(
+            "List all active (non-deleted) projects on the server, with id, "
+            "name, root path, and description. Useful for finding a project's "
+            "id when the user names one you're not currently in (e.g. to bind "
+            "a cron to it via `add_cron(project_id=...)`)."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    ),
+    _list_projects,
 )
 
 

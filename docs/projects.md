@@ -246,13 +246,72 @@ Projects are not coupled to agents. You can bind sessions from `scribe`,
 same root, system-prompt section, and upload location. This is intended —
 projects represent shared artifacts, not agent-private territory.
 
+## Cron entries can be bound to a project
+
+Each cron entry has an optional `project_id`. When set, every fire of that
+cron creates a session already bound to the project — the system prompt
+includes the "Project" stanza from turn 1, and uploads land in the
+project's `uploads/`.
+
+**REST:**
+
+```
+PUT /agents/{name}/crons/{cron_id}
+Body: { "expr": "...", "prompt": "...", "project_id": "<uuid>" | null }
+```
+
+`project_id` is optional. When omitted on an update, the existing binding
+is preserved (so "just change the schedule" works). Explicit `null`
+detaches. Unknown or soft-deleted project → `404`.
+
+`GET /agents/{name}/crons` returns `project_id` and `project_name` on each
+row. A cron whose bound project was soft-deleted returns `project_name:
+null` (the id survives for audit).
+
+**Agent tool:**
+
+```python
+add_cron(id, expr, prompt, project_id?)
+```
+
+To discover a project's id, agents can call the new `list_projects` tool
+(active projects only), or `get_current_session_info` if their current
+session is already in the project they want.
+
+**Scheduler behavior when the bound project is soft-deleted between
+definition and fire time:** the scheduler logs a warning to stderr
+(`[scheduler] cron X for agent Y: bound project Z is deleted, firing in
+workspace mode`), still fires the cron, and records the dangling
+`project_id` on the session row for audit. `runtime.session_project()`
+returns `None` for the deleted project, so the session runs project-less
+(no Project stanza in the system prompt, uploads back to the workspace).
+
+**CLI:**
+
+```
+ark cron set <agent> <id> "<expr>" --prompt "..." --project <name>     # bind
+ark cron set <agent> <id> "<expr>" --prompt "..." --no-project          # detach
+ark cron set <agent> <id> "<expr>" --prompt "..."                       # keep whatever's already bound
+ark cron list <agent>                                                    # shows [project=<name>] annotation
+```
+
+Sharp edges:
+
+- **No enforcement of project consistency across an agent's crons.** One
+  agent can have crons bound to different projects (or none at all)
+  simultaneously. This is a feature — a single "operations" agent can run
+  scheduled work across multiple projects.
+- **No connection to a user's conversational session** in the same
+  project. Cron-fired sessions and user sessions are independent even when
+  both are in the same project. Use `post_to_session` if a cron needs to
+  hand its output to a conversational session.
+
 ## What v1 doesn't cover
 
-- **Heartbeat and cron sessions in projects.** The scheduler creates these
-  without a `project_id` today. If you want a cron to operate inside a
-  project, the cleanest workaround is to have the cron prompt include the
-  project root path explicitly. A future revision could store `project_id`
-  on cron entries.
+- **Heartbeats aren't project-bound.** They're agent-level scheduling —
+  the "check on things you own" tick. If a heartbeat needs to touch a
+  project, its `heartbeat_prompt.md` can mention the project root
+  explicitly.
 - **Concurrent-edit locking.** If the agent is writing a file via
   `write_file` while the client is editing it via `PUT /files/...`, last
   write wins. No conflict detection in v1.

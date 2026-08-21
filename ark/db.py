@@ -92,6 +92,16 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX idx_sessions_cron ON sessions(agent_name, cron_id, created_at DESC);
         """,
     ),
+    (
+        5,
+        # Cron entries can be bound to a project, so their fires spawn sessions
+        # already attached to that project (system prompt gets the project
+        # stanza from turn 1, uploads land in the project's uploads dir, etc.).
+        # Nullable — existing crons keep firing project-less sessions unchanged.
+        # No FK: we intentionally allow a cron to reference a soft-deleted
+        # project without cascading. The scheduler handles that gracefully.
+        "ALTER TABLE crons ADD COLUMN project_id TEXT;",
+    ),
 ]
 
 

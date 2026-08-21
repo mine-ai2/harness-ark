@@ -88,7 +88,7 @@ def create_app(config: Config) -> FastAPI:
             "SELECT heartbeat_seconds FROM agent_state WHERE agent_name = ?", (name,)
         ).fetchone()
         crons = conn.execute(
-            "SELECT id, expr, prompt FROM crons WHERE agent_name = ? AND enabled = 1",
+            "SELECT id, expr, prompt, project_id FROM crons WHERE agent_name = ? AND enabled = 1",
             (name,),
         ).fetchall()
         mcp_manager = mcp.get_manager()
@@ -205,10 +205,21 @@ def create_app(config: Config) -> FastAPI:
         if name not in config.agents:
             raise HTTPException(404, "unknown agent")
         rows = conn.execute(
-            "SELECT id, expr, prompt, enabled FROM crons WHERE agent_name = ? ORDER BY id",
+            "SELECT id, expr, prompt, enabled, project_id "
+            "FROM crons WHERE agent_name = ? ORDER BY id",
             (name,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            d["project_name"] = None
+            if d["project_id"]:
+                p = projects.get(conn, d["project_id"])
+                # Show name even for soft-deleted so the operator can see WHAT
+                # was bound and understand why fires are running project-less.
+                d["project_name"] = p.name if p is not None else None
+            out.append(d)
+        return out
 
     @app.put("/agents/{name}/crons/{cron_id}")
     def upsert_cron(name: str, cron_id: str, body: dict):
@@ -224,11 +235,34 @@ def create_app(config: Config) -> FastAPI:
             croniter(expr)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, f"invalid cron expression: {e}")
-        conn.execute(
-            "INSERT INTO crons(agent_name, id, expr, prompt, enabled) VALUES (?,?,?,?,1) "
-            "ON CONFLICT(agent_name, id) DO UPDATE SET expr=excluded.expr, prompt=excluded.prompt, enabled=1",
-            (name, cron_id, expr, prompt),
-        )
+        # `project_id` is optional. When present it must be a string uuid of
+        # an existing, non-soft-deleted project; explicit null detaches.
+        # Omitted → keep whatever was there on update, or null on insert.
+        project_id_present = "project_id" in body
+        project_id = body.get("project_id")
+        if project_id_present and project_id is not None:
+            if not isinstance(project_id, str):
+                raise HTTPException(400, "'project_id' must be a string or null")
+            p = projects.get(conn, project_id)
+            if p is None or p.deleted_at is not None:
+                raise HTTPException(404, "unknown project")
+        if project_id_present:
+            conn.execute(
+                "INSERT INTO crons(agent_name, id, expr, prompt, enabled, project_id) "
+                "VALUES (?,?,?,?,1,?) "
+                "ON CONFLICT(agent_name, id) DO UPDATE SET "
+                "expr=excluded.expr, prompt=excluded.prompt, enabled=1, "
+                "project_id=excluded.project_id",
+                (name, cron_id, expr, prompt, project_id),
+            )
+        else:
+            # Omitted → don't touch project_id on existing rows; keep null on new.
+            conn.execute(
+                "INSERT INTO crons(agent_name, id, expr, prompt, enabled) VALUES (?,?,?,?,1) "
+                "ON CONFLICT(agent_name, id) DO UPDATE SET "
+                "expr=excluded.expr, prompt=excluded.prompt, enabled=1",
+                (name, cron_id, expr, prompt),
+            )
         return {"ok": True}
 
     @app.delete("/agents/{name}/crons/{cron_id}")

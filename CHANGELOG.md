@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased — Cron entries can be bound to a project
+
+A cron entry can now carry an optional `project_id`. Every fire of that
+cron creates a session already attached to the project — system prompt
+gets the project stanza from turn 1, uploads land in the project's dir.
+See [docs/projects.md § Cron entries can be bound to a project](docs/projects.md#cron-entries-can-be-bound-to-a-project).
+
+### Schema migration v5
+
+Adds `crons.project_id TEXT` (nullable). Existing crons keep firing
+project-less sessions unchanged. No FK — a cron intentionally survives a
+soft-deleted project (the scheduler warns + fires anyway; the resulting
+session runs project-less).
+
+### REST changes
+
+```
+PUT /agents/{name}/crons/{cron_id}
+Body: { "expr": "...", "prompt": "...", "project_id"?: "<uuid>" | null }
+```
+
+- `project_id` present with a string → validated (404 on unknown or
+  soft-deleted target), then bound.
+- `project_id: null` → detach.
+- `project_id` omitted → **preserve existing binding on update** (so
+  "just change the schedule" doesn't accidentally clobber the project
+  binding), null on insert.
+
+`GET /agents/{name}/crons` and `GET /agents/{name}` return `project_id`
+and (on the former) `project_name` for each cron. A cron whose bound
+project was soft-deleted returns `project_id` unchanged with
+`project_name: null`.
+
+### Agent tools
+
+- `add_cron(id, expr, prompt, project_id?)` — new optional parameter,
+  validated at add time. Backwards-compatible: existing 3-arg calls keep
+  working.
+- `list_crons` now shows `[project=<name>]` (or `[project=<id> DELETED]`
+  for dangling refs) next to each cron.
+- **New `list_projects` tool** — returns the active (non-deleted)
+  projects with `id`, `name`, `root`, `description`. Complements
+  `get_current_session_info` (which only surfaces the current session's
+  project) — useful when the user names a project the agent isn't
+  currently in.
+
+### Scheduler
+
+- Reads `crons.project_id` on tick, threads it through `_fire_cron` →
+  `_drive` → `runtime.create_session`.
+- If the bound project is soft-deleted at fire time: logs a warning to
+  stderr (`[scheduler] cron X for agent Y: bound project Z is deleted,
+  firing in workspace mode`), still fires. The session row records the
+  dangling id (audit trail); `runtime.session_project()` returns None for
+  the soft-deleted project so the session runs project-less.
+
+### CLI
+
+```
+ark cron set <agent> <id> "<expr>" --prompt "..." --project <name>    # bind by name
+ark cron set <agent> <id> "<expr>" --prompt "..." --no-project         # detach
+ark cron set <agent> <id> "<expr>" --prompt "..."                      # keep whatever's bound
+ark cron list <agent>                                                   # now shows [project=<name>]
+```
+
+`--project` accepts a name (resolved via `GET /projects`);
+`--no-project` and `--project` are mutually exclusive.
+
+### Sharp edges
+
+- **No cascade on project delete.** A cron bound to a soft-deleted
+  project keeps firing project-less. This is intentional — the user might
+  restore the project (rename another to it, etc.) and expects the cron
+  binding to remain. If it's undesired, remove the cron or PATCH it
+  detach.
+- **No connection between cron-fired sessions and a user's conversational
+  session** in the same project. Use `post_to_session` if the cron needs
+  to surface output to a human's active thread.
+- **Heartbeats are unchanged** — they're agent-level, not project-level.
+  A heartbeat that needs project scope can name the project root
+  explicitly in its `heartbeat_prompt.md`.
+
 ## Unreleased — Mutable session ↔ project binding
 
 Session-to-project assignment was previously immutable. It's now mutable
