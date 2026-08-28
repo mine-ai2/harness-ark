@@ -68,6 +68,17 @@ class AgentConfig:
     # Subset of mcp_servers whose tools are exposed on every turn without
     # requiring the agent to call load_skill first. Mirrors always_loaded_skills.
     always_loaded_mcp_servers: list[str] = field(default_factory=list)
+    # Prompt caching (mine-capstone#697): cache_control markers on providers
+    # that support them (Anthropic native + anthropic/* via OpenRouter).
+    prompt_caching: bool = True
+    # In-memory tool-result elision (never touches rows): once the in-view
+    # tool-result bytes exceed tool_result_max_bytes, ONE pass elides
+    # results older than the last tool_result_keep_turns user turns that
+    # are larger than tool_result_elide_over. Hysteresis by design — a
+    # per-turn trim would bust the prompt cache every turn.
+    tool_result_keep_turns: int = 2
+    tool_result_elide_over: int = 2048
+    tool_result_max_bytes: int = 65536
 
 
 @dataclass
@@ -257,6 +268,16 @@ def _agents(
                     f"agents.{name}.always_loaded_mcp_servers references '{s}' "
                     f"which is not in agents.{name}.mcp_servers"
                 )
+        prompt_caching = cfg.get("prompt_caching", True)
+        if not isinstance(prompt_caching, bool):
+            raise ConfigError(f"agents.{name}.prompt_caching must be a boolean")
+
+        def _int_knob(key: str, default: int) -> int:
+            value = cfg.get(key, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ConfigError(f"agents.{name}.{key} must be a non-negative integer")
+            return value
+
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -267,5 +288,9 @@ def _agents(
             max_tokens=max_tok,
             mcp_servers=list(agent_mcp),
             always_loaded_mcp_servers=list(always_mcp),
+            prompt_caching=prompt_caching,
+            tool_result_keep_turns=_int_knob("tool_result_keep_turns", 2),
+            tool_result_elide_over=_int_knob("tool_result_elide_over", 2048),
+            tool_result_max_bytes=_int_knob("tool_result_max_bytes", 65536),
         )
     return out
