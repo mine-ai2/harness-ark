@@ -238,3 +238,19 @@ def test_absent_metadata_falls_back_to_config(skill, tool_context, monkeypatch):
     assert json.loads(skill.mineai_list_tools())["ok"] is True
     assert seen["url"].startswith("https://api.example.com/")
     assert seen["headers"] == {"X-Harness-Secret": "s3cret"}
+
+
+def test_call_tool_options_passthrough(skill, tool_context, monkeypatch):
+    """mine-capstone#696: options rides the body only when given."""
+    bodies = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        bodies.append(json)
+        return _Response(200, {"ok": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    skill.mineai_call_tool(name="documents.read", arguments={"id": "d1"})
+    assert "options" not in bodies[0]
+    skill.mineai_call_tool(name="documents.read", arguments={"id": "d1"},
+                           options={"full": True})
+    assert bodies[1]["options"] == {"full": True}

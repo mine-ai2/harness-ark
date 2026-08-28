@@ -117,25 +117,28 @@ def mineai_list_tools(pack: "str | None" = None, names: "list[str] | None" = Non
 
 
 @tool
-def mineai_call_tool(name: str, arguments: "dict[str, object]") -> str:
+def mineai_call_tool(name: str, arguments: "dict[str, object]",
+                     options: "dict[str, object] | None" = None) -> str:
     """Invoke one MineAI tool by name with a JSON-object of arguments; returns {ok, result} or {ok: false, error}.
 
     Errors carry ``error.remediation`` (what to do) and ``error.retryable``
     — read them instead of retrying blindly. A result with
     ``replayed: true`` means the call already ran (the gateway deduplicated
-    a transport retry) — do NOT re-issue it.
+    a transport retry) — do NOT re-issue it. Oversized results arrive
+    COMPACTED with a ``_compaction`` block (mine-capstone#696) — pass
+    ``options={"full": true}`` when you truly need the whole payload.
     """
     session_id = current_context().session_id
     # mine-capstone#694: one idempotency key per INVOCATION, sent on both
     # transport attempts (the _post retry reuses this payload) — the
     # gateway's replay guard turns the 15 s-timeout double-send into a
     # single execution.
-    return _post(
-        "/api/agent-gateway/call-tool",
-        {
-            "session_id": session_id,
-            "tool": name,
-            "arguments": arguments,
-            "idempotency_key": uuid.uuid4().hex,
-        },
-    )
+    payload: "dict[str, object]" = {
+        "session_id": session_id,
+        "tool": name,
+        "arguments": arguments,
+        "idempotency_key": uuid.uuid4().hex,
+    }
+    if options:
+        payload["options"] = options
+    return _post("/api/agent-gateway/call-tool", payload)
