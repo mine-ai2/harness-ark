@@ -99,7 +99,51 @@ def test_call_tool_passes_name_and_arguments(skill, tool_context, monkeypatch):
     result = json.loads(skill.mineai_call_tool(name="work.get", arguments={"id": "abc"}))
     assert result["ok"] is True and result["result"]["key"] == "BD-184"
     assert seen["url"].endswith("/api/agent-gateway/call-tool")
+    # mine-capstone#694: one idempotency key per invocation rides the body.
+    key = seen["body"].pop("idempotency_key")
+    assert isinstance(key, str) and len(key) == 32 and int(key, 16) is not None
     assert seen["body"] == {"session_id": "ark-sess-42", "tool": "work.get", "arguments": {"id": "abc"}}
+
+
+def test_idempotency_key_stable_across_transport_retry_and_fresh_per_invocation(
+    skill, tool_context, monkeypatch
+):
+    """mine-capstone#694: the 15 s-timeout double-send must carry the SAME
+    key (so the gateway replays instead of double-executing), while a new
+    invocation mints a new one."""
+    bodies = []
+
+    def flaky_post(url, json=None, headers=None, timeout=None):
+        bodies.append(json)
+        if len(bodies) == 1:
+            raise httpx.ConnectError("first attempt dies")
+        return _Response(200, {"ok": True, "result": {}})
+
+    monkeypatch.setattr(httpx, "post", flaky_post)
+    skill.mineai_call_tool(name="work.update", arguments={"id": "x"})
+    assert len(bodies) == 2
+    assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"]
+
+    monkeypatch.setattr(httpx, "post",
+                        lambda *a, **k: (bodies.append(k.get("json")), _Response(200, {"ok": True}))[1])
+    skill.mineai_call_tool(name="work.update", arguments={"id": "x"})
+    assert bodies[2]["idempotency_key"] != bodies[0]["idempotency_key"]
+
+
+def test_list_tools_optional_narrowing(skill, tool_context, monkeypatch):
+    """mine-capstone#692: pack / names ride the body only when given; names
+    cap at 20."""
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen.update(body=json)
+        return _Response(200, {"ok": True, "tools": []})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    skill.mineai_list_tools(pack="deals")
+    assert seen["body"] == {"session_id": "ark-sess-42", "pack": "deals"}
+    skill.mineai_list_tools(names=[f"t{i}" for i in range(25)])
+    assert len(seen["body"]["names"]) == 20
 
 
 def test_structured_denial_unwrapped_from_fastapi_detail(skill, tool_context, monkeypatch):
