@@ -41,7 +41,7 @@ class _ToolThenStop:
         self.name, self.args = name, args
         self.turns = 0
 
-    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
         self.turns += 1
         if self.turns == 1:
             yield ToolCallEvent(id="tc1", name=self.name, input=self.args)

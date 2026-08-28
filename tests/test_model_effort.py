@@ -39,7 +39,7 @@ class _CaptureProvider:
     def __init__(self):
         self.calls = []
 
-    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
         self.calls.append({"model": model, "max_tokens": max_tokens})
         yield TurnUsageEvent(input_tokens=10, output_tokens=5, model=None)
         yield AssistantTurnEnd(text="ok", stop_reason="end_turn")

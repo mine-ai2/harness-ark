@@ -26,7 +26,11 @@
       "model": "moonshotai/kimi-k3",
       "max_context_tokens": 256000,
       "always_loaded_skills": ["mineai_tools"],
-      "max_tokens": 8192
+      "max_tokens": 8192,
+      "prompt_caching": true,
+      "tool_result_keep_turns": 2,
+      "tool_result_elide_over": 2048,
+      "tool_result_max_bytes": 65536
     }
   }
 }

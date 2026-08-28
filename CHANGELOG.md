@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — context efficiency: named blocks, tool-result elision, prompt caching
+
+Port of the upstream context-efficiency PR
+([druths/ark#4](https://github.com/druths/ark/pull/4)) onto the fork
+(mine-capstone#697), minus the compaction integration this build doesn't
+have.
+
+- **Named context blocks.** `POST .../context` accepts `"name"`; a named
+  block is replaced at prompt-build time — the LAST text renders at the
+  FIRST occurrence's position — so a periodically refreshed block (focus
+  object, mode note) stops growing the prompt. Unnamed appends stay
+  additive; history rows are never mutated. The response gains
+  `replaced: true|false`.
+- **`GET .../context` introspection**: `system_prompt_bytes`,
+  `blocks[{name, bytes, seq}]` deduped exactly as rendered, latest usage,
+  `context_window`, and `compactions` (always 0 here, kept for shape
+  parity with upstream).
+- **Tool-result elision** (in-memory only, rows untouched): once in-view
+  tool-result bytes exceed `tool_result_max_bytes` (64 KB), ONE pass
+  replaces results older than the last `tool_result_keep_turns` (2) user
+  turns and larger than `tool_result_elide_over` (2 KB) with a short stub.
+  Single-pass hysteresis by design — a per-turn trim would bust the
+  provider prompt cache every turn.
+- **Prompt caching** (`agents.<name>.prompt_caching`, default true):
+  `cache_control` markers on the system block and conversation tail for
+  Anthropic native and `anthropic/*` via OpenRouter. Usage is normalized
+  across all three adapters so `input_tokens` is ALWAYS the total prompt;
+  `cached_input_tokens`/`cache_write_tokens` land on `TurnMetrics` rows,
+  `turn_usage` wire events, and the CLI's usage line (`% cached`).
+- kimi-k3 added to the context-window table (256k).
+
 ## Unreleased — share_with_client no longer poisons the conversation
 
 `share_with_client` appends its `SharedFile` row from inside the tool call,

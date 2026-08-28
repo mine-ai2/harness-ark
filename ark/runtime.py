@@ -258,7 +258,27 @@ def system_prompt(
         )
         out += proj
     if contexts:
-        joined = "\n\n".join(c.text for c in contexts if c.text.strip())
+        # Named-block dedupe (mine-capstone#697): a NAMED block renders the
+        # text of its LAST occurrence at the position of its FIRST, so a
+        # refreshed block (focus object, mode note) replaces itself instead
+        # of growing the prompt. Unnamed blocks stay additive in order.
+        latest: dict[str, str] = {}
+        for c in contexts:
+            if c.name and c.text.strip():
+                latest[c.name] = c.text
+        seen: set[str] = set()
+        parts: list[str] = []
+        for c in contexts:
+            if not c.text.strip():
+                continue
+            if c.name:
+                if c.name in seen:
+                    continue
+                seen.add(c.name)
+                parts.append(latest[c.name])
+            else:
+                parts.append(c.text)
+        joined = "\n\n".join(parts)
         if joined:
             out += (
                 "\n\n---\n"
@@ -270,14 +290,86 @@ def system_prompt(
     return out
 
 
-def append_context(conn: sqlite3.Connection, session_id: str, text: str) -> int:
-    """Append a SessionContext message to a session. Returns the new total."""
+def append_context(
+    conn: sqlite3.Connection,
+    session_id: str,
+    text: str,
+    name: str | None = None,
+) -> tuple[int, bool]:
+    """Append a SessionContext message to a session.
 
-    append_message(conn, session_id, SessionContext(text=text))
-    return conn.execute(
+    Returns ``(total, replaced)`` — ``replaced`` is True when ``name`` is
+    given and a block of that name already existed (the prompt-build dedupe
+    in :func:`system_prompt` will render this text in the old position).
+    Rows are append-only; nothing is mutated."""
+
+    replaced = False
+    if name:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? "
+            "AND role = 'session_context' "
+            "AND json_extract(content_json, '$.name') = ?",
+            (session_id, name),
+        ).fetchone()
+        replaced = bool(row and row[0])
+    append_message(conn, session_id, SessionContext(text=text, name=name))
+    total = conn.execute(
         "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'session_context'",
         (session_id,),
     ).fetchone()[0]
+    return total, replaced
+
+
+def elide_tool_results(
+    messages: list[Message],
+    keep_turns: int = 2,
+    elide_over: int = 2048,
+    max_bytes: int = 65536,
+) -> list[Message]:
+    """In-memory tool-result elision (mine-capstone#697) — rows untouched.
+
+    HYSTERESIS by design: nothing happens until the total in-view
+    tool-result bytes exceed ``max_bytes``; then ONE pass replaces results
+    older than the last ``keep_turns`` user turns that are larger than
+    ``elide_over`` with a short stub naming the tool and call id. A
+    per-turn trim would change the prompt prefix every turn and bust the
+    provider prompt cache — one bulk pass keeps it warm between passes."""
+
+    total = sum(
+        len(m.output.encode("utf-8"))
+        for m in messages
+        if isinstance(m, ToolResult) and isinstance(m.output, str)
+    )
+    if total <= max_bytes:
+        return messages
+    # The index of the user turn ``keep_turns`` from the end — everything at
+    # or after it is protected.
+    user_indexes = [i for i, m in enumerate(messages) if isinstance(m, UserText)]
+    protected_from = user_indexes[-keep_turns] if len(user_indexes) >= keep_turns else 0
+    out: list[Message] = []
+    for i, m in enumerate(messages):
+        if (
+            isinstance(m, ToolResult)
+            and i < protected_from
+            and isinstance(m.output, str)
+            and len(m.output.encode("utf-8")) > elide_over
+        ):
+            size = len(m.output.encode("utf-8"))
+            out.append(
+                ToolResult(
+                    call_id=m.call_id,
+                    output=(
+                        f"[tool result elided: {size} bytes; tool "
+                        f"{m.name or 'unknown'}; call {m.call_id} — re-run "
+                        "if needed]"
+                    ),
+                    is_error=m.is_error,
+                    name=m.name,
+                )
+            )
+        else:
+            out.append(m)
+    return out
 
 
 _PROVIDER_MESSAGE_KEYS = ("message", "error_description", "detail")
@@ -481,6 +573,13 @@ async def run_user_turn(
         history = load_history(conn, session_id)
         contexts = [m for m in history if isinstance(m, SessionContext)]
         turn_messages = [m for m in history if not isinstance(m, _llm_excluded)]
+        if agent.tool_result_max_bytes:
+            turn_messages = elide_tool_results(
+                turn_messages,
+                keep_turns=agent.tool_result_keep_turns,
+                elide_over=agent.tool_result_elide_over,
+                max_bytes=agent.tool_result_max_bytes,
+            )
         system = system_prompt(agent, contexts, project=project)
         active = tools.active_schemas(agent, skills_for_session)
         pending_tool_calls: list[ToolCallEvent] = []
@@ -496,6 +595,7 @@ async def run_user_turn(
                     messages=turn_messages,
                     tools=active,
                     max_tokens=max_output_tokens,
+                    prompt_caching=agent.prompt_caching,
                 ):
                     emitted_any = True
                     if isinstance(evt, TextDelta):
@@ -514,6 +614,8 @@ async def run_user_turn(
                                 input_tokens=evt.input_tokens,
                                 output_tokens=evt.output_tokens,
                                 model=evt.model or model,
+                                cached_input_tokens=evt.cached_input_tokens,
+                                cache_write_tokens=evt.cache_write_tokens,
                             ),
                         )
                         # Re-emit with the agent's known context_window so the
@@ -523,6 +625,8 @@ async def run_user_turn(
                             output_tokens=evt.output_tokens,
                             model=evt.model or model,
                             context_window=context_window,
+                            cached_input_tokens=evt.cached_input_tokens,
+                            cache_write_tokens=evt.cache_write_tokens,
                         )
                     elif isinstance(evt, AssistantTurnEnd):
                         last_stop_reason = evt.stop_reason
@@ -655,6 +759,8 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
             "output_tokens": evt.output_tokens,
             "model": evt.model,
             "context_window": evt.context_window,
+            "cached_input_tokens": evt.cached_input_tokens,
+            "cache_write_tokens": evt.cache_write_tokens,
         }
     if isinstance(evt, RunErrorEvent):
         return {"type": "error", "code": evt.code, "message": evt.message}

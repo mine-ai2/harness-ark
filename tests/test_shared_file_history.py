@@ -109,7 +109,7 @@ class _ShareTwiceThenStop:
         self.turns = 0
         self.sent: list[list] = []
 
-    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096):
+    async def stream_turn(self, *, model, system, messages, tools, max_tokens=4096, prompt_caching=False):
         self.turns += 1
         self.sent.append(list(messages))
         if self.turns == 1:

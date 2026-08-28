@@ -287,9 +287,13 @@ druths/ark` (the sync script adds the `upstream` remote if missing).
   tree may diverge from upstream.
 - Any change under `ark/` core must be an upstream-PR candidate — written
   as if druths/ark would merge it, never a MineAI-only hack.
-- The two currently sanctioned core extensions are: real mid-turn cancel
-  (mine-capstone#485, branch `ark-real-cancel`) and per-agent `max_tokens`
-  (mine-capstone#481, `talos-provisioning`).
+- The currently sanctioned core extensions are: real mid-turn cancel
+  (mine-capstone#485, branch `ark-real-cancel`), per-agent `max_tokens`
+  (mine-capstone#481, `talos-provisioning`), and the context-efficiency
+  set (mine-capstone#697: named context blocks, tool-result elision,
+  prompt caching + cache telemetry) — submitted upstream as
+  [druths/ark#4](https://github.com/druths/ark/pull/4) and carried here
+  until it lands.
 
 **Process:** run [scripts/sync-upstream.sh](scripts/sync-upstream.sh) from
 any clean checkout. It fetches both remotes; if upstream is already
