@@ -172,7 +172,11 @@ text for shared files), so the model sees a complete and coherent transcript.
 - **Chunked / resumable uploads.** One shot, max 25 MB.
 - **Sending file *contents* to the model.** The model is told a file exists
   and where; it must call `read_file` to look at the bytes. Native
-  multimodal upload (vision, PDF) is a separate, larger piece.
+  multimodal upload (vision, PDF) is a separate, larger piece. The one
+  exception is TOOL imagery: a skill can attach images to its own result via
+  the in-band `__ark_images__` key (`runtime.split_tool_images`) and the
+  Anthropic provider renders them as image content blocks — how
+  `mineai_call_tool` shows the model `map.satellite` pictures.
 - **Per-file permissions.** Anything in the workspace is downloadable by any
   client with the bearer token. The token is the only credential.
 - **Server-initiated push.** Files only become visible to clients when the

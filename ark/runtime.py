@@ -320,6 +320,39 @@ def append_context(
     return total, replaced
 
 
+def split_tool_images(output: str) -> "tuple[str, list[dict[str, str]] | None]":
+    """Pop the in-band ``__ark_images__`` attachment a skill may embed in a
+    JSON tool result (the mineai_tools image protocol) — the images ride the
+    ToolResult as first-class content blocks, never as base64 text the model
+    would read as prose. Anything unparseable passes through untouched."""
+    if '"__ark_images__"' not in output:
+        return output, None
+    import json as _json
+
+    try:
+        body = _json.loads(output)
+    except ValueError:
+        return output, None
+    if not isinstance(body, dict):
+        return output, None
+    raw = body.pop("__ark_images__", None)
+    images = [
+        {"media_type": str(i.get("media_type") or "image/png"), "data_b64": i["data_b64"]}
+        for i in (raw if isinstance(raw, list) else [])
+        if isinstance(i, dict) and isinstance(i.get("data_b64"), str) and i["data_b64"]
+    ]
+    if not images:
+        return output, None
+    return _json.dumps(body), images
+
+
+def _tool_result_bytes(m: ToolResult) -> int:
+    size = len(m.output.encode("utf-8")) if isinstance(m.output, str) else 0
+    for img in m.images or []:
+        size += len(img.get("data_b64", ""))
+    return size
+
+
 def elide_tool_results(
     messages: list[Message],
     keep_turns: int = 2,
@@ -333,10 +366,12 @@ def elide_tool_results(
     older than the last ``keep_turns`` user turns that are larger than
     ``elide_over`` with a short stub naming the tool and call id. A
     per-turn trim would change the prompt prefix every turn and bust the
-    provider prompt cache — one bulk pass keeps it warm between passes."""
+    provider prompt cache — one bulk pass keeps it warm between passes.
+    Attached images count toward both thresholds and are dropped with the
+    stub (they dwarf any text payload)."""
 
     total = sum(
-        len(m.output.encode("utf-8"))
+        _tool_result_bytes(m)
         for m in messages
         if isinstance(m, ToolResult) and isinstance(m.output, str)
     )
@@ -352,14 +387,15 @@ def elide_tool_results(
             isinstance(m, ToolResult)
             and i < protected_from
             and isinstance(m.output, str)
-            and len(m.output.encode("utf-8")) > elide_over
+            and _tool_result_bytes(m) > elide_over
         ):
-            size = len(m.output.encode("utf-8"))
+            size = _tool_result_bytes(m)
+            dropped = f" (+{len(m.images)} image(s) dropped)" if m.images else ""
             out.append(
                 ToolResult(
                     call_id=m.call_id,
                     output=(
-                        f"[tool result elided: {size} bytes; tool "
+                        f"[tool result elided: {size} bytes{dropped}; tool "
                         f"{m.name or 'unknown'}; call {m.call_id} — re-run "
                         "if needed]"
                     ),
@@ -686,11 +722,17 @@ async def run_user_turn(
         )
         for tc in pending_tool_calls:
             output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
+            images = None
+            if not is_error:
+                # In-band image attachments (map.satellite) become first-class
+                # blocks on the result; the SSE event carries the text only.
+                output, images = split_tool_images(output)
             append_message(
                 conn,
                 session_id,
                 ToolResult(
-                    call_id=tc.id, output=output, is_error=is_error, name=tc.name
+                    call_id=tc.id, output=output, is_error=is_error, name=tc.name,
+                    images=images,
                 ),
             )
             yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)

@@ -2,6 +2,8 @@
 replace semantics, in-memory tool-result elision with hysteresis, cache
 telemetry on TurnMetrics/TurnUsageEvent, and the /context endpoint."""
 
+import json
+
 from fastapi.testclient import TestClient
 
 from ark import runtime
@@ -9,6 +11,7 @@ from ark.config import AgentConfig, Config, ProviderConfig, ServerConfig
 from ark.server import create_app
 from ark.types import (
     SessionContext,
+    ToolCall,
     ToolResult,
     TurnMetrics,
     UserText,
@@ -138,6 +141,40 @@ def test_elision_one_pass_protects_recent_turns():
     assert "elided" not in last_result.output
     # The ORIGINAL list is untouched (rows never mutate).
     assert all("elided" not in m.output for m in messages if isinstance(m, ToolResult))
+
+
+def test_split_tool_images_pops_the_attachment():
+    body = json.dumps({"ok": True, "result": {"x": 1},
+                       "__ark_images__": [{"media_type": "image/png", "data_b64": "aGk="}]})
+    output, images = runtime.split_tool_images(body)
+    assert images == [{"media_type": "image/png", "data_b64": "aGk="}]
+    assert json.loads(output) == {"ok": True, "result": {"x": 1}}
+    # No marker / bad json / empty list all pass through untouched.
+    assert runtime.split_tool_images("plain text") == ("plain text", None)
+    assert runtime.split_tool_images('__ark_images__ but "__ark_images__" not json') == (
+        '__ark_images__ but "__ark_images__" not json', None)
+    empty = json.dumps({"ok": True, "__ark_images__": []})
+    assert runtime.split_tool_images(empty) == (empty, None)
+
+
+def test_elision_counts_and_drops_attached_images():
+    img = {"media_type": "image/png", "data_b64": "A" * 70000}
+    messages = [
+        UserText(text="look at the site"),
+        ToolCall(id="t1", name="map.satellite", input={}),
+        ToolResult(call_id="t1", output='{"ok": true}', name="map.satellite", images=[img]),
+        UserText(text="turn 2"),
+        UserText(text="turn 3"),
+        ToolCall(id="t2", name="map.satellite", input={}),
+        ToolResult(call_id="t2", output='{"ok": true}', name="map.satellite", images=[img]),
+    ]
+    # Text alone is tiny — only the image bytes push this over max_bytes.
+    out = runtime.elide_tool_results(messages, keep_turns=2, elide_over=2048, max_bytes=65536)
+    old = next(m for m in out if isinstance(m, ToolResult) and m.call_id == "t1")
+    recent = next(m for m in out if isinstance(m, ToolResult) and m.call_id == "t2")
+    assert "elided" in old.output and "1 image(s) dropped" in old.output
+    assert old.images is None
+    assert recent.images == [img]  # protected window keeps its picture
 
 
 # ---------------------------------------------------------------------------
