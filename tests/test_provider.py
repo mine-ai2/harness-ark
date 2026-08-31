@@ -77,6 +77,29 @@ def test_tool_results_collapse_into_one_user_message():
     ]
 
 
+def test_tool_result_images_become_anthropic_image_blocks():
+    out = to_anthropic_messages(
+        [
+            ToolResult(
+                call_id="t1",
+                output='{"ok": true}',
+                images=[{"media_type": "image/png", "data_b64": "aGk="}],
+            ),
+            ToolResult(call_id="t2", output="plain"),
+        ]
+    )
+    blocks = out[0]["content"]
+    assert blocks[0]["content"] == [
+        {"type": "text", "text": '{"ok": true}'},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+        },
+    ]
+    # Image-less results keep the plain string content (cache-stable shape).
+    assert blocks[1]["content"] == "plain"
+
+
 def test_empty_assistant_text_block_is_dropped():
     out = to_anthropic_messages(
         [AssistantText(text=""), ToolCall(id="x", name="n", input={})]

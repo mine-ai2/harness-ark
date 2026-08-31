@@ -43,6 +43,11 @@ class ToolResult:
     output: str
     is_error: bool = False
     name: str = ""  # name of the tool that produced this result (required by Google's API)
+    # Images the tool attached for the MODEL to look at (mine-capstone
+    # map.satellite): [{"media_type": "image/png", "data_b64": "..."}].
+    # Anthropic providers render them as image content blocks after the text;
+    # other providers currently drop them (same posture as MCP image content).
+    images: "list[dict[str, str]] | None" = None
 
 
 @dataclass
@@ -272,6 +277,8 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
         }
         if msg.name:
             body["name"] = msg.name
+        if msg.images:
+            body["images"] = msg.images
         return "tool_result", body
     if isinstance(msg, UploadMessage):
         return "upload", {
@@ -326,6 +333,7 @@ def message_from_row(role: str, content: dict[str, Any]) -> Message:
             output=content["output"],
             is_error=content.get("is_error", False),
             name=content.get("name", ""),
+            images=content.get("images"),
         )
     if role == "upload":
         return UploadMessage(

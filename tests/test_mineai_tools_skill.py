@@ -254,3 +254,75 @@ def test_call_tool_options_passthrough(skill, tool_context, monkeypatch):
     skill.mineai_call_tool(name="documents.read", arguments={"id": "d1"},
                            options={"full": True})
     assert bodies[1]["options"] == {"full": True}
+
+
+# ---------------------------------------------------------------------------
+# agent_image attachment (map.satellite → __ark_images__)
+# ---------------------------------------------------------------------------
+
+
+class _PngResponse:
+    def __init__(self, content=b"\x89PNG-bytes", status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("bad", request=None, response=None)
+
+
+def _satellite_body():
+    return {
+        "ok": True,
+        "result": {
+            "render_id": "r-1",
+            "agent_image": {"url": "/api/agent-gateway/render-image/r-1",
+                            "media_type": "image/png"},
+        },
+    }
+
+
+def test_agent_image_is_fetched_and_embedded_in_band(skill, tool_context, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Response(200, _satellite_body()))
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        seen["secret"] = headers.get("X-Harness-Secret")
+        return _PngResponse()
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    out = json.loads(skill.mineai_call_tool(name="map.satellite", arguments={}))
+    assert seen["url"] == "https://api.example.com/api/agent-gateway/render-image/r-1"
+    assert seen["secret"] == "s3cret"
+    import base64
+
+    assert out["__ark_images__"] == [{
+        "media_type": "image/png",
+        "data_b64": base64.b64encode(b"\x89PNG-bytes").decode("ascii"),
+    }]
+    assert out["result"]["agent_image"] == {"attached": True, "media_type": "image/png"}
+
+
+def test_agent_image_fetch_failure_degrades_to_text(skill, tool_context, monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Response(200, _satellite_body()))
+
+    def dead_get(*a, **k):
+        raise httpx.ConnectError("no route")
+
+    monkeypatch.setattr(httpx, "get", dead_get)
+    out = json.loads(skill.mineai_call_tool(name="map.satellite", arguments={}))
+    assert "__ark_images__" not in out
+    assert out["result"]["agent_image"]["attached"] is False
+    assert "image fetch failed" in out["result"]["agent_image"]["note"]
+
+
+def test_results_without_agent_image_pass_through_untouched(skill, tool_context, monkeypatch):
+    body = {"ok": True, "result": {"items": []}}
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Response(200, body))
+
+    def never_get(*a, **k):  # pragma: no cover — must not be called
+        raise AssertionError("no image fetch expected")
+
+    monkeypatch.setattr(httpx, "get", never_get)
+    assert json.loads(skill.mineai_call_tool(name="t.x", arguments={})) == body

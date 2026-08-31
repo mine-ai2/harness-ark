@@ -141,4 +141,43 @@ def mineai_call_tool(name: str, arguments: "dict[str, object]",
     }
     if options:
         payload["options"] = options
-    return _post("/api/agent-gateway/call-tool", payload)
+    return _attach_agent_images(_post("/api/agent-gateway/call-tool", payload))
+
+
+_IMAGE_MAX_BYTES = 8 * 1024 * 1024  # sanity cap on a fetched tool image
+
+
+def _attach_agent_images(body_json: str) -> str:
+    """Tools that produce imagery for the MODEL (map.satellite) mark their
+    result with ``agent_image`` — fetch the bytes through the gateway's
+    secret-gated endpoint and embed them as the in-band ``__ark_images__``
+    attachment the Ark runtime lifts into real image content blocks
+    (``split_tool_images``). Any failure degrades to the text-only result
+    with a note, never an error."""
+    if '"agent_image"' not in body_json:
+        return body_json
+    try:
+        body = json.loads(body_json)
+    except ValueError:
+        return body_json
+    result = body.get("result") if isinstance(body, dict) else None
+    ref = result.get("agent_image") if isinstance(result, dict) else None
+    path = ref.get("url") if isinstance(ref, dict) else None
+    if not isinstance(path, str) or not path.startswith("/"):
+        return body_json
+    try:
+        url, secret = _gateway()
+        resp = httpx.get(f"{url}{path}", headers={"X-Harness-Secret": secret}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        if len(resp.content) > _IMAGE_MAX_BYTES:
+            raise ValueError(f"image too large ({len(resp.content)} bytes)")
+        import base64
+
+        body["__ark_images__"] = [{
+            "media_type": str(ref.get("media_type") or "image/png"),
+            "data_b64": base64.b64encode(resp.content).decode("ascii"),
+        }]
+        result["agent_image"] = {"attached": True, "media_type": ref.get("media_type") or "image/png"}
+    except Exception as exc:  # noqa: BLE001 — imagery is best-effort
+        result["agent_image"] = {"attached": False, "note": f"image fetch failed: {exc}"}
+    return json.dumps(body)

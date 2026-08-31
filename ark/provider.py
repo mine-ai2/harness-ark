@@ -214,10 +214,25 @@ def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
             blocks = []
             while i < n and isinstance(messages[i], ToolResult):
                 tr = messages[i]
+                content: Any = tr.output
+                if tr.images:
+                    # Attached images (map.satellite) become real image
+                    # content blocks after the text — the model SEES them.
+                    content = [{"type": "text", "text": tr.output or "(image result)"}] + [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": img.get("media_type", "image/png"),
+                                "data": img.get("data_b64", ""),
+                            },
+                        }
+                        for img in tr.images
+                    ]
                 block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tr.call_id,
-                    "content": tr.output,
+                    "content": content,
                 }
                 if tr.is_error:
                     block["is_error"] = True
