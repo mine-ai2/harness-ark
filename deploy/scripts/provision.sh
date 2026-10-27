@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Provision one harness environment on DigitalOcean (mine-capstone#469).
+# Provision one harness environment on DigitalOcean (mine-capstone#469,
+# #1085).
 #
 # Runs on an operator machine with authenticated `doctl` (flat deploy/*.sh
 # scripts run ON the VM; deploy/scripts/*.sh run from outside). Creates,
 # per environment: tag, cloud firewall (22+443 only), deploy SSH keypair,
 # block-storage volume, droplet (cloud-init from
-# deploy/cloud-init/user-data.tmpl.yml), and a DNS A record. Dev and prod
-# share nothing.
+# deploy/cloud-init/user-data.tmpl.yml), and a DNS A record. No two
+# environments share anything: dev, prod, and one production harness per
+# customer (Ark session/project ids only mean something on the harness that
+# created them, so a harness is never re-pointed at another app).
 #
 # Idempotent converge: safe to re-run after a partial failure — existing
 # resources are verified and kept, missing ones created. The droplet's
@@ -14,7 +17,8 @@
 # re-run (the data volume survives: mkfs is guarded on the volume being
 # blank).
 #
-# Usage: provision.sh <dev|prod>
+# Usage: provision.sh <dev|prod|<customer>> [--gh-env NAME] [--dry-run]
+#        (provision.sh --help for the details)
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,14 +43,106 @@ note() {
     echo "provision.sh: $*"
 }
 
+usage() {
+    cat <<'EOF'
+Usage:
+  provision.sh dev          harness-dev        -> GitHub environment development
+  provision.sh prod         harness-prod       -> GitHub environment production
+  provision.sh <customer>   harness-<customer> -> GitHub environment production-<customer>
+
+<customer> is the customer slug: lowercase a-z, 0-9 and inner hyphens, at
+most 51 characters (e.g. `provision.sh acme` -> harness-acme,
+production-acme). development, production, harness and their "-..." forms
+are refused: they are environment/droplet names, not slugs.
+
+Options:
+  --gh-env NAME   use NAME as the GitHub environment instead of the derived
+                  one (development/production stay reserved for dev/prod)
+  --dry-run       print every derived name and the setup checklist, then exit
+                  before the first doctl call (same as PROVISION_DRY_RUN=1)
+  -h, --help      show this help
+
+Environment overrides: DO_REGION, DO_VPC_UUID, DROPLET_SIZE, DROPLET_IMAGE,
+VOLUME_SIZE, DNS_ZONE, DNS_TTL, BREAK_GLASS_KEYS, and (customers only)
+APP_HOST, the paired app's host (default <customer>.<DNS_ZONE>).
+EOF
+}
+
 # --- Arguments and derived names ---------------------------------------------
 
-ENV_NAME="${1:-}"
+ENV_NAME=""
+GH_ENV_OVERRIDE=""
+case "${PROVISION_DRY_RUN:-0}" in
+0) DRY_RUN=0 ;;
+1) DRY_RUN=1 ;;
+*) die "PROVISION_DRY_RUN must be 0 or 1" ;;
+esac
+while (($#)); do
+    case "$1" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    --dry-run) DRY_RUN=1 ;;
+    --gh-env)
+        [[ $# -ge 2 && -n $2 && $2 != -* ]] || die "--gh-env needs a NAME"
+        GH_ENV_OVERRIDE="$2"
+        shift
+        ;;
+    --gh-env=*) GH_ENV_OVERRIDE="${1#*=}" ;;
+    -*)
+        usage >&2
+        die "unknown option: $1"
+        ;;
+    *)
+        [[ -z $ENV_NAME ]] || die "one environment per run (got '$ENV_NAME' and '$1')"
+        ENV_NAME="$1"
+        ;;
+    esac
+    shift
+done
+
+IS_CUSTOMER=0
 case "$ENV_NAME" in
+"")
+    usage >&2
+    die "missing environment: dev, prod, or a customer slug"
+    ;;
 dev) GH_ENV=development ;;
 prod) GH_ENV=production ;;
-*) die "usage: provision.sh <dev|prod>" ;;
+# Lookalikes: an operator pasting a GitHub environment or droplet name
+# instead of the slug would otherwise get production-production-acme /
+# harness-harness-acme, or a second "production" harness
+# (harness-production) next to harness-prod that nothing deploys to.
+development | development-* | production | production-* | harness | harness-*)
+    die "'$ENV_NAME' is an environment or droplet name, not a slug: use dev, prod, or the bare customer slug (provision.sh acme)"
+    ;;
+*)
+    # ^[a-z0-9-]+$ without a leading/trailing hyphen: the slug becomes a DNS
+    # label (harness-<c>.mine.ai) and DO resource names. 51 = the 64-char
+    # cap on DO volume names minus "harness-" and "-data".
+    [[ $ENV_NAME =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+        || die "invalid customer slug '$ENV_NAME': lowercase a-z, 0-9 and inner hyphens only"
+    ((${#ENV_NAME} <= 51)) || die "customer slug '$ENV_NAME' is longer than 51 characters"
+    GH_ENV="production-$ENV_NAME"
+    IS_CUSTOMER=1
+    ;;
 esac
+
+if [[ -n $GH_ENV_OVERRIDE ]]; then
+    [[ $GH_ENV_OVERRIDE =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "invalid --gh-env '$GH_ENV_OVERRIDE': letters, digits, '.', '_' and '-' only"
+    # The printed setup commands overwrite the environment's SSH key and
+    # DEPLOY_HOST: aiming another droplet at development/production would
+    # re-point that environment's deploys.
+    case "$GH_ENV_OVERRIDE" in
+    development | production)
+        [[ $GH_ENV_OVERRIDE == "$GH_ENV" ]] \
+            || die "--gh-env $GH_ENV_OVERRIDE is reserved for $([[ $GH_ENV_OVERRIDE == development ]] && echo dev || echo prod)"
+        ;;
+    esac
+    GH_ENV="$GH_ENV_OVERRIDE"
+fi
 
 DROPLET="harness-$ENV_NAME"
 VOLUME="$DROPLET-data"
@@ -54,6 +150,113 @@ FIREWALL="$DROPLET-fw"
 FQDN="$DROPLET.$DNS_ZONE"
 TAG_ENV="$DROPLET"
 KEYFILE="$HOME/.ssh/$DROPLET-deploy"
+# Customers pair with their own mine-capstone app (GitHub environment
+# prod-<c> there). MINEAI_GATEWAY_URL / API_PUBLIC_BASE_URL are the app's
+# host ROOT: Ark appends /api/agent-gateway/... itself.
+APP_HOST="${APP_HOST:-$ENV_NAME.$DNS_ZONE}"
+APP_GH_ENV="prod-$ENV_NAME"
+
+cat <<EOF
+provision.sh: environment '$ENV_NAME'
+  GitHub environment  $GH_ENV (mine-ai2/harness-ark)
+  droplet             $DROPLET ($DROPLET_SIZE, $DROPLET_IMAGE, $DO_REGION)
+  volume              $VOLUME ($VOLUME_SIZE)
+  firewall            $FIREWALL (inbound tcp 22 + 443)
+  tag                 $TAG_ENV (+ shared label harness)
+  DNS                 $FQDN (A record in $DNS_ZONE, TTL $DNS_TTL)
+  deploy keypair      $KEYFILE
+EOF
+if ((IS_CUSTOMER)); then
+    cat <<EOF
+  paired app          https://$APP_HOST (mine-capstone environment $APP_GH_ENV)
+EOF
+fi
+
+# Everything after provisioning: GitHub environment wiring, the
+# operator-supplied secrets, and (customers) the app-side pairing. Reads the
+# globals above plus IP and KNOWN_HOSTS. Prints names and commands only;
+# never a secret value.
+print_setup() {
+    local ENV_BODY
+    if [[ $ENV_NAME == dev ]]; then
+        ENV_BODY='{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}'
+    else
+        # Production-class: every leg of the talos-deploy matrix waits for its
+        # own environment's required reviewer.
+        ENV_BODY='{"reviewers": [{"type": "User", "id": <reviewer-user-id>}],
+ "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}'
+    fi
+
+    cat <<EOF
+
+Configure GitHub environment $GH_ENV (protection rules first):
+
+  gh api -X PUT repos/mine-ai2/harness-ark/environments/$GH_ENV --input - <<'JSON'
+$ENV_BODY
+JSON
+  gh api -X POST repos/mine-ai2/harness-ark/environments/$GH_ENV/deployment-branch-policies -f name=main -f type=branch
+EOF
+    if [[ $ENV_NAME != dev ]]; then
+        echo "  # <reviewer-user-id>: gh api users/<login> --jq .id"
+    fi
+    cat <<EOF
+  gh secret set SSH_PRIVATE_KEY   --repo mine-ai2/harness-ark --env $GH_ENV < $KEYFILE
+  gh variable set DEPLOY_HOST     --repo mine-ai2/harness-ark --env $GH_ENV --body "$IP"
+  gh variable set DEPLOY_USER     --repo mine-ai2/harness-ark --env $GH_ENV --body "deploy"
+  gh variable set DEPLOY_DOMAIN   --repo mine-ai2/harness-ark --env $GH_ENV --body "$FQDN"
+  gh variable set SSH_KNOWN_HOSTS --repo mine-ai2/harness-ark --env $GH_ENV --body "\$(cat <<'KNOWN'
+$KNOWN_HOSTS
+KNOWN
+)"
+
+Still needed from the operator (values are never printed here; gh prompts):
+  gh secret set OPENAI_API_KEY        --repo mine-ai2/harness-ark --env $GH_ENV
+  gh secret set OPENROUTER_API_KEY    --repo mine-ai2/harness-ark --env $GH_ENV   # required by render-config.sh
+EOF
+    if ((IS_CUSTOMER)); then
+        cat <<EOF
+  ARK_AUTH_SECRET, MINEAI_GATEWAY_SECRET, MINEAI_GATEWAY_URL: the pairing block below
+
+Pair with the mine-capstone app (generate once, set in BOTH repos; values go
+over stdin, never argv):
+
+  ARK=\$(openssl rand -hex 32); GW=\$(openssl rand -hex 32)
+  printf '%s' "\$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env $APP_GH_ENV
+  printf '%s' "\$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env $GH_ENV
+  printf '%s' "\$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env $APP_GH_ENV
+  printf '%s' "\$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env $GH_ENV
+  gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env $GH_ENV --body "https://$APP_HOST"
+  unset ARK GW
+
+  App side, not secret (mine-capstone .do/customers/$ENV_NAME.vars):
+    HARNESS_ARK_URL="https://$FQDN"
+  The app's spec template derives API_PUBLIC_BASE_URL=https://$APP_HOST (host
+  root, no /api); it must equal MINEAI_GATEWAY_URL above.
+
+Then add $GH_ENV to the deploy-prod matrix in
+.github/workflows/talos-deploy.yml (PR to main). Once merged, every
+talos-deploy run has a $GH_ENV leg that waits for its reviewer. Smoke:
+  ARK_AUTH_SECRET=... deploy/scripts/smoke.sh $FQDN
+EOF
+    else
+        cat <<EOF
+  gh secret set ARK_AUTH_SECRET       --repo mine-ai2/harness-ark --env $GH_ENV   # openssl rand -hex 32, unique per env; = the app's HARNESS_ARK_SECRET
+  gh secret set MINEAI_GATEWAY_URL    --repo mine-ai2/harness-ark --env $GH_ENV   # the app's host root https://<host> (no /api) = its API_PUBLIC_BASE_URL
+  gh secret set MINEAI_GATEWAY_SECRET --repo mine-ai2/harness-ark --env $GH_ENV   # = the app's HARNESS_GATEWAY_SECRET
+
+Then deploy (push to main or workflow_dispatch talos-deploy) and smoke:
+  ARK_AUTH_SECRET=... deploy/scripts/smoke.sh $FQDN
+EOF
+    fi
+}
+
+if ((DRY_RUN)); then
+    IP="<droplet-ip>"
+    KNOWN_HOSTS="<ssh-keyscan -t ed25519 lines, captured after first boot>"
+    print_setup
+    note "dry run: nothing created, no doctl or gh call made"
+    exit 0
+fi
 
 # --- Preflight ---------------------------------------------------------------
 
@@ -197,26 +400,6 @@ note "verified: cloud-init done, /mnt/harness-data mounted, caddy active"
 
 # --- Emit GitHub environment setup -------------------------------------------
 
-cat <<EOF
-
-provision.sh: $DROPLET is ready. Configure the GitHub environment:
-
-  gh api -X PUT repos/mine-ai2/harness-ark/environments/$GH_ENV
-  gh secret set SSH_PRIVATE_KEY --env $GH_ENV < $KEYFILE
-  gh variable set DEPLOY_HOST     --env $GH_ENV --body "$IP"
-  gh variable set DEPLOY_USER     --env $GH_ENV --body "deploy"
-  gh variable set DEPLOY_DOMAIN   --env $GH_ENV --body "$FQDN"
-  gh variable set SSH_KNOWN_HOSTS --env $GH_ENV --body "\$(cat <<'KNOWN'
-$KNOWN_HOSTS
-KNOWN
-)"
-
-Still needed from the operator (never printed here):
-  gh secret set ARK_AUTH_SECRET       --env $GH_ENV   # openssl rand -hex 32, unique per env
-  gh secret set OPENAI_API_KEY     --env $GH_ENV
-  gh secret set MINEAI_GATEWAY_URL    --env $GH_ENV
-  gh secret set MINEAI_GATEWAY_SECRET --env $GH_ENV
-
-Then deploy (push to main or workflow_dispatch talos-deploy) and smoke:
-  ARK_AUTH_SECRET=... deploy/scripts/smoke.sh $FQDN
-EOF
+echo
+note "$DROPLET is ready."
+print_setup
