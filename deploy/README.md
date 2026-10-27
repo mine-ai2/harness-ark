@@ -51,8 +51,21 @@ run **from outside it** (operator laptop or CI runner).
 
 ### What one environment is
 
-Per environment (`dev` → GitHub environment `development`, `prod` →
-`production`) — dev and prod share **nothing**:
+The argument to `provision.sh` names the environment. No two environments
+share **anything**:
+
+| Argument | GitHub environment | Droplet / FQDN | Deployed by `talos-deploy` |
+|---|---|---|---|
+| `dev` | `development` | `harness-dev` / `harness-dev.mine.ai` | `deploy-dev`, on every push to `main` |
+| `prod` | `production` | `harness-prod` / `harness-prod.mine.ai` | `deploy-prod` matrix leg `production`, required reviewer |
+| `<c>`, a customer slug (e.g. `acme`) | `production-<c>` | `harness-<c>` / `harness-<c>.mine.ai` | `deploy-prod` matrix leg `production-<c>`, its own required reviewer |
+
+Each customer gets its own production harness, paired with that customer's
+mine-capstone app: Ark session/project ids stored in the app's database only
+mean something on the harness that created them, so a harness is never
+re-pointed at another app.
+
+Resources per environment:
 
 | Resource | Name (dev shown) | Notes |
 |---|---|---|
@@ -63,7 +76,7 @@ Per environment (`dev` → GitHub environment `development`, `prod` →
 | Deploy keypair | `~/.ssh/harness-dev-deploy` | ed25519, no passphrase (CI consumes it) |
 | Tag | `harness-dev` (+ shared label `harness`) | binds firewall to droplet |
 
-Cost: ~$25/mo per environment (~$50 total for both).
+Cost: ~$25/mo per environment.
 
 ### Provision an environment
 
@@ -71,8 +84,23 @@ Prerequisites: authenticated `doctl` and `gh`; the DO account's SSH keys
 ("Main", "milo-agent") act as root break-glass.
 
 ```sh
-deploy/scripts/provision.sh dev    # or: prod
+deploy/scripts/provision.sh <dev|prod|<customer>>
+deploy/scripts/provision.sh dev              # or: prod
+deploy/scripts/provision.sh acme             # customer: harness-acme, GitHub env production-acme
+deploy/scripts/provision.sh acme --dry-run   # print every derived name + the checklist; touches nothing
+deploy/scripts/provision.sh --help
 ```
+
+A customer slug is lowercase `a-z`, `0-9` and inner hyphens (`^[a-z0-9-]+$`,
+no leading/trailing hyphen, at most 51 characters, since it becomes a DNS
+label and DO resource names). `development`, `production`, `harness` and
+their `-…` forms are refused: they are environment/droplet names, so passing
+one means a pasted name, not a slug. `--gh-env NAME` overrides the derived
+GitHub environment, but never onto `development`/`production` from another
+argument (the printed commands would overwrite that environment's SSH key
+and host). `--dry-run` (or `PROVISION_DRY_RUN=1`) exits before the first
+`doctl` call, so it runs anywhere. `APP_HOST` (default `<c>.mine.ai`) is the
+paired app's host used in the pairing block.
 
 Idempotent converge — safe to re-run after a partial failure; existing
 resources are kept. The droplet's cloud-init
@@ -86,15 +114,45 @@ because of the format-if-blank guard.
 
 The script ends by verifying first boot over SSH (`cloud-init status`,
 mountpoint, caddy active) and printing the exact `gh` commands that wire
-the GitHub environment (`SSH_PRIVATE_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`,
-`DEPLOY_DOMAIN`, `SSH_KNOWN_HOSTS`). Five secrets remain operator-supplied:
+the GitHub environment: its protection rules first (deployment branch
+`main`; production environments also get a required reviewer), then
+`SSH_PRIVATE_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_DOMAIN`,
+`SSH_KNOWN_HOSTS`. Five secrets remain operator-supplied:
 `ARK_AUTH_SECRET` (`openssl rand -hex 32`, unique per env), `OPENAI_API_KEY`,
-`OPENROUTER_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`.
+`OPENROUTER_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`. For a
+customer, three of them come from the pairing block below.
 
 Until the first deploy runs, `https://<domain>/health` returns **502 —
 this is expected**: Caddy is up (cert issuance takes 1–5 min once the DNS
 record lands; watch `journalctl -u caddy`) but ark isn't installed yet.
 The first talos-deploy run fixes that.
+
+### Pair a customer harness with its app
+
+A customer harness pairs with exactly one mine-capstone app, whose secrets
+live in that repo's GitHub environment `prod-<c>`. Generate the two pairing
+secrets once and set them on **both** sides (`provision.sh <c>` prints this
+block with the names filled in; values go over stdin, never argv):
+
+```sh
+ARK=$(openssl rand -hex 32); GW=$(openssl rand -hex 32)
+printf '%s' "$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env prod-<c>
+printf '%s' "$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env production-<c>
+printf '%s' "$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env prod-<c>
+printf '%s' "$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env production-<c>
+gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env production-<c> --body "https://<host>"
+unset ARK GW
+```
+
+App side, not secret: `.do/customers/<c>.vars` in mine-capstone sets
+`HARNESS_ARK_URL="https://harness-<c>.mine.ai"`, and the app's spec template
+derives `API_PUBLIC_BASE_URL=https://<host>`. That is the host **root**, no
+`/api` (Ark appends `/api/agent-gateway/...`), and it must equal the
+harness's `MINEAI_GATEWAY_URL`. To rotate a pairing secret, set both sides,
+deploy the harness first, then the app; agent calls get 401 in between.
+
+Then add `production-<c>` to the `deploy-prod` matrix (see "Automated
+deploys" below).
 
 ### Access model
 
@@ -154,7 +212,9 @@ deploy/scripts/provision.sh dev      # recreates droplet, re-runs cloud-init
 # then update DEPLOY_HOST + SSH_KNOWN_HOSTS in the GitHub environment and redeploy
 ```
 
-Full teardown (destroys data; rotate the GH environment secrets after):
+Full teardown (destroys data; rotate the GH environment secrets after). For
+a customer, first remove `production-<c>` from the `deploy-prod` matrix, or
+every later push to `main` has a leg that fails at SSH:
 
 ```sh
 doctl compute droplet delete harness-dev
@@ -222,14 +282,27 @@ curl -fsS http://127.0.0.1:7777/health   # -> {"ok": true}
 
 [.github/workflows/talos-deploy.yml](../.github/workflows/talos-deploy.yml)
 deploys on every push to `main` (and via manual `workflow_dispatch`, e.g.
-after rotating a secret). Two GitHub environments, configured in repo
-settings → Environments, both with deployment-branch policy `main`:
+after rotating a secret). The steps live once, in the reusable
+[talos-deploy-env.yml](../.github/workflows/talos-deploy-env.yml)
+(`workflow_call`, input `environment`); talos-deploy.yml calls it per
+environment. GitHub environments are configured in repo settings →
+Environments, all with deployment-branch policy `main`:
 
-- **development** — auto-deploys on every push to `main`.
-- **production** — same steps, but the job waits for required-reviewer
-  approval, and via `needs:` only ever deploys a commit whose dev deploy
-  already passed the health gate. Pending approvals accumulate one per push;
-  approve only the latest.
+- **development** (`deploy-dev`) — auto-deploys on every push to `main`.
+- **production** and one `production-<c>` per customer (`deploy-prod`,
+  a matrix with one leg per environment) — same steps, but each leg waits
+  for its own environment's required-reviewer approval, and via `needs:`
+  only ever deploys a commit whose dev deploy already passed the health
+  gate. `fail-fast: false`: one leg failing or being rejected never cancels
+  another. Pending approvals accumulate one per push per leg; approve only
+  the latest.
+
+**The `deploy-prod` matrix list in talos-deploy.yml is where a new customer
+is added**: after `provision.sh <c>`, the environment setup and the pairing
+above, a PR to `main` adds `production-<c>` to
+`strategy.matrix.environment`. Each leg runs in concurrency group
+`deploy-<environment>` (never cancelled mid-flight), and the job's first
+step names any missing secret or variable before the droplet is touched.
 
 Per-environment **secrets**: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 `ARK_AUTH_SECRET`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`, `SSH_PRIVATE_KEY` (dedicated
