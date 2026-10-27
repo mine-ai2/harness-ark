@@ -89,7 +89,10 @@ while (($#)); do
         GH_ENV_OVERRIDE="$2"
         shift
         ;;
-    --gh-env=*) GH_ENV_OVERRIDE="${1#*=}" ;;
+    --gh-env=*)
+        GH_ENV_OVERRIDE="${1#*=}"
+        [[ -n $GH_ENV_OVERRIDE ]] || die "--gh-env needs a NAME"
+        ;;
     -*)
         usage >&2
         die "unknown option: $1"
