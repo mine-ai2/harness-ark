@@ -41,9 +41,13 @@ jobs:
       fail-fast: false
       matrix:
         # One leg per production harness. Add `production-<c>` here to
-        # onboard a customer (mine-capstone#1086) after
-        # `deploy/scripts/provision.sh <c>` and its environment setup;
-        # remove it before tearing that harness down.
+        # onboard a customer (mine-capstone#1086), but ONLY once that
+        # environment already exists with its required reviewer and
+        # deployment branch policy `main` (run the protection commands that
+        # `deploy/scripts/provision.sh <c>` prints first). A name listed here
+        # before its environment exists makes GitHub auto-create it
+        # UNPROTECTED on the next run: no reviewer, any branch. Remove the
+        # entry before tearing that harness down.
         environment: [production]
     uses: ./.github/workflows/talos-deploy-env.yml
     with:

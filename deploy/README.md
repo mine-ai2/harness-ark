@@ -93,14 +93,17 @@ deploy/scripts/provision.sh --help
 
 A customer slug is lowercase `a-z`, `0-9` and inner hyphens (`^[a-z0-9-]+$`,
 no leading/trailing hyphen, at most 51 characters, since it becomes a DNS
-label and DO resource names). `development`, `production`, `harness` and
-their `-…` forms are refused: they are environment/droplet names, so passing
-one means a pasted name, not a slug. `--gh-env NAME` overrides the derived
-GitHub environment, but never onto `development`/`production` from another
-argument (the printed commands would overwrite that environment's SSH key
-and host). `--dry-run` (or `PROVISION_DRY_RUN=1`) exits before the first
-`doctl` call, so it runs anywhere. `APP_HOST` (default `<c>.mine.ai`) is the
-paired app's host used in the pairing block.
+label and DO resource names). `development`, `production`, `harness` (each
+also as `-…`) and `prod-…` are refused: they are environment/droplet names,
+so passing one means a pasted name, not a slug. `--gh-env NAME` overrides
+the derived GitHub environment (same charset as a slug), but
+`development[-…]`/`production[-…]` only when equal to the derived name: the
+printed commands would otherwise overwrite another environment's SSH key and
+host. `--dry-run` (or `PROVISION_DRY_RUN=1`) exits before the first `doctl`
+call, so it runs anywhere. `APP_HOST` (default `<c>.mine.ai`; validated as a
+lowercase hostname, like `DNS_ZONE`) is the paired app's host used in the
+pairing block. [tests/test-provision.sh](tests/test-provision.sh) (run by
+talos-test) pins all of this with `doctl`/`gh`/`ssh` stubbed.
 
 Idempotent converge — safe to re-run after a partial failure; existing
 resources are kept. The droplet's cloud-init
@@ -115,9 +118,10 @@ because of the format-if-blank guard.
 The script ends by verifying first boot over SSH (`cloud-init status`,
 mountpoint, caddy active) and printing the exact `gh` commands that wire
 the GitHub environment: its protection rules first (deployment branch
-`main`; production environments also get a required reviewer), then
-`SSH_PRIVATE_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_DOMAIN`,
-`SSH_KNOWN_HOSTS`. Five secrets remain operator-supplied:
+`main`; production environments also get a required reviewer; skip that
+`PUT` when re-running against an existing environment, since it would
+replace the reviewer list), then `SSH_PRIVATE_KEY`, `DEPLOY_HOST`,
+`DEPLOY_USER`, `DEPLOY_DOMAIN`, `SSH_KNOWN_HOSTS`. Five secrets remain operator-supplied:
 `ARK_AUTH_SECRET` (`openssl rand -hex 32`, unique per env), `OPENAI_API_KEY`,
 `OPENROUTER_API_KEY`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`. For a
 customer, three of them come from the pairing block below.
@@ -130,18 +134,30 @@ The first talos-deploy run fixes that.
 ### Pair a customer harness with its app
 
 A customer harness pairs with exactly one mine-capstone app, whose secrets
-live in that repo's GitHub environment `prod-<c>`. Generate the two pairing
-secrets once and set them on **both** sides (`provision.sh <c>` prints this
-block with the names filled in; values go over stdin, never argv):
+live in that repo's GitHub environment `prod-<c>`. **Precondition: create
+`prod-<c>` in mine-capstone first** (its required reviewer and deployment
+branches, per the mine-capstone new-customer runbook). Then generate the two
+pairing secrets once and set them on **both** sides. `provision.sh <c>`
+prints this block with the names filled in. It checks that both environments
+exist before generating anything, so it never sets one side only; if any
+step fails, re-run the whole block (it regenerates and overwrites both
+sides). Values go over stdin, never argv:
 
 ```sh
-ARK=$(openssl rand -hex 32); GW=$(openssl rand -hex 32)
-printf '%s' "$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env prod-<c>
-printf '%s' "$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env production-<c>
-printf '%s' "$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env prod-<c>
-printf '%s' "$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env production-<c>
-gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env production-<c> --body "https://<host>"
-unset ARK GW
+if gh api repos/mine-ai2/mine-capstone/environments/prod-<c> --silent &&
+   gh api repos/mine-ai2/harness-ark/environments/production-<c> --silent; then
+  ARK=$(openssl rand -hex 32); GW=$(openssl rand -hex 32)
+  printf '%s' "$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env prod-<c> &&
+  printf '%s' "$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env production-<c> &&
+  printf '%s' "$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env prod-<c> &&
+  printf '%s' "$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env production-<c> &&
+  gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env production-<c> --body "https://<host>" &&
+  echo "paired: harness-ark production-<c> <-> mine-capstone prod-<c>" ||
+  echo "PAIRING INCOMPLETE: re-run this whole block" >&2
+  unset ARK GW
+else
+  echo "nothing set: create mine-capstone env prod-<c> and harness-ark env production-<c> first" >&2
+fi
 ```
 
 App side, not secret: `.do/customers/<c>.vars` in mine-capstone sets
@@ -300,7 +316,11 @@ Environments, all with deployment-branch policy `main`:
 **The `deploy-prod` matrix list in talos-deploy.yml is where a new customer
 is added**: after `provision.sh <c>`, the environment setup and the pairing
 above, a PR to `main` adds `production-<c>` to
-`strategy.matrix.environment`. Each leg runs in concurrency group
+`strategy.matrix.environment`. The environment must already exist with its
+required reviewer and branch policy `main` before that PR merges: a matrix
+name with no environment behind it makes GitHub auto-create one
+**unprotected** on the next run. (talos-test also rejects matrix entries
+that are not `production` or `production-<slug>`.) Each leg runs in concurrency group
 `deploy-<environment>` (never cancelled mid-flight), and the job's first
 step names any missing secret or variable before the droplet is touched.
 

@@ -143,6 +143,8 @@ expect_refused "$PROVISION" acme- --dry-run
 expect_refused "$PROVISION" -acme --dry-run
 expect_refused "$PROVISION" ac_me --dry-run
 expect_refused "$PROVISION" 'acme;id' --dry-run
+# A valid hostname label sequence, so only the slug regex stops it.
+expect_refused "$PROVISION" acme.example --dry-run
 expect_refused "$PROVISION" "$(printf 'a%.0s' {1..52})" --dry-run
 expect_refused "$PROVISION" production --dry-run
 expect_refused "$PROVISION" production-acme --dry-run
@@ -173,10 +175,11 @@ expect_refused DNS_ZONE='mine.ai;id' "$PROVISION" acme --dry-run
 expect_refused PROVISION_DRY_RUN=true "$PROVISION" acme --dry-run
 
 # --- 3. The printed pairing block never pairs one-sided -----------------------
-block="$(sed -n '/^  if gh api repos\/mine-ai2\/mine-capstone\/environments\//,/^  fi$/p' <<<"$acme_out")"
+# Everything between "never argv:" and the block's closing `fi`.
+block="$(sed -n '/never argv:$/,/^  fi$/p' <<<"$acme_out" | sed 1d)"
 [[ -n $block ]] || fail "pairing block not found in acme --dry-run output"
-check_line="$(grep -n 'environments/prod-acme --silent' <<<"$acme_out" | head -1 | cut -d: -f1)"
-rand_line="$(grep -n 'openssl rand' <<<"$acme_out" | head -1 | cut -d: -f1)"
+check_line="$(grep -n 'environments/prod-acme --silent' <<<"$acme_out" | head -1 | cut -d: -f1 || true)"
+rand_line="$(grep -n 'openssl rand' <<<"$acme_out" | head -1 | cut -d: -f1 || true)"
 if [[ -z $check_line || -z $rand_line ]] || ((check_line >= rand_line)); then
     fail "pairing block generates secrets before checking the environments"
 fi

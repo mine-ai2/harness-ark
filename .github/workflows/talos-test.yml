@@ -29,8 +29,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - run: shellcheck deploy/*.sh deploy/scripts/*.sh
-      - run: bash -n deploy/*.sh deploy/scripts/*.sh
+      - run: shellcheck deploy/*.sh deploy/scripts/*.sh deploy/tests/*.sh
+      - run: bash -n deploy/*.sh deploy/scripts/*.sh deploy/tests/*.sh
+      # Guards below use `if grep …; then exit 1; fi`, never `! grep`: under
+      # bash -e a `!` command that is not the last line can't fail the step.
       - name: Config render test
         # Exercises the exact script deploys use, so a template variable
         # missing from render-config.sh's allowlist fails here: unquoted
@@ -42,7 +44,10 @@ jobs:
                  MINEAI_GATEWAY_SECRET=dummy
           deploy/render-config.sh deploy/config/config.json.tmpl > /tmp/rendered.json
           python3 -m json.tool /tmp/rendered.json > /dev/null
-          ! grep -q '\${' /tmp/rendered.json
+          # shellcheck disable=SC2016 # a literal ${ is the thing searched for
+          if grep -qF '${' /tmp/rendered.json; then
+            echo "::error::unrendered \${...} left in config.json"; exit 1
+          fi
       - name: User-data render test
         # Same drift guard for the cloud-init template: renders through the
         # exact script provision.sh uses, must stay valid YAML, and only
@@ -54,8 +59,35 @@ jobs:
           deploy/scripts/render-user-data.sh deploy/cloud-init/user-data.tmpl.yml > /tmp/user-data.yml
           pip install --quiet pyyaml
           python3 -c 'import yaml; yaml.safe_load(open("/tmp/user-data.yml"))'
-          ! grep -qE '\$\{(DOMAIN|VOLUME_NAME|DEPLOY_PUBKEY)\}' /tmp/user-data.yml
+          if grep -qE '\$\{(DOMAIN|VOLUME_NAME|DEPLOY_PUBKEY)\}' /tmp/user-data.yml; then
+            echo "::error::unrendered allowlisted variable left in user-data"; exit 1
+          fi
           head -1 /tmp/user-data.yml | grep -qx '#cloud-config'
           # Non-ASCII in user-data gets mangled to C1 control chars on the
           # DO metadata path, making cloud-init discard the whole config.
-          ! LC_ALL=C grep -q '[^ -~]' /tmp/user-data.yml
+          if LC_ALL=C grep -q '[^ -~]' /tmp/user-data.yml; then
+            echo "::error::non-ASCII in user-data"; exit 1
+          fi
+      - name: provision.sh tests
+        # doctl/gh/ssh/… are stubbed first on PATH and log every call: dry
+        # runs must call nothing, hostile input must be refused, and the
+        # printed pairing block must never pair one side only.
+        run: deploy/tests/test-provision.sh
+      - name: talos-deploy structure
+        # needs/secrets/fail-fast/matrix names: what actionlint can't see.
+        run: |
+          pip install --quiet pyyaml
+          python3 deploy/tests/check-talos-deploy.py
+      - name: actionlint
+        # Pinned release, verified by checksum. Lints every workflow,
+        # including the reusable-workflow call contract, and shellchecks
+        # each run: block (shellcheck is preinstalled on the runner).
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color

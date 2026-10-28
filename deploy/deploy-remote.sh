@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Remote side of the automated deploy (mine-capstone#470). Executed as root
-# over SSH by .github/workflows/talos-deploy.yml AFTER the workflow has
-# rsynced the repo to /opt/harness-ark:
+# over SSH by .github/workflows/talos-deploy-env.yml (called by
+# talos-deploy.yml once per environment) AFTER the workflow has rsynced the
+# repo to /opt/harness-ark:
 #
 #   ssh deploy@host 'sudo /opt/harness-ark/deploy/deploy-remote.sh' < deploy.env
 #
