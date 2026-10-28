@@ -1,0 +1,138 @@
+# MineAI-specific workflow (namespaced "talos-" so an upstream-added workflow
+# can never collide at sync time).
+#
+# Deploys ONE harness environment (mine-capstone#1085). Reusable only: called
+# by talos-deploy.yml for `development` and then for every leg of its
+# production matrix, so the steps are written once and the legs can never
+# drift apart.
+#
+# Secrets and variables resolve from `inputs.environment`. This job declares
+# `environment:`, which is how a called workflow gets environment-level
+# secrets/vars (a caller cannot pass them; `secrets: inherit` in the caller
+# only covers repo/org secrets). The same declaration applies that
+# environment's protection rules, so each production leg waits for its own
+# required reviewer and only `main` may deploy.
+#
+# Required per environment: secrets SSH_PRIVATE_KEY, ARK_AUTH_SECRET,
+# OPENAI_API_KEY, OPENROUTER_API_KEY, MINEAI_GATEWAY_URL,
+# MINEAI_GATEWAY_SECRET; variables DEPLOY_HOST, DEPLOY_USER, DEPLOY_DOMAIN,
+# SSH_KNOWN_HOSTS. deploy/scripts/provision.sh prints the setup commands.
+name: talos-deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment to deploy (development, production, production-<c>)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false # never kill a mid-flight rsync/restart
+    steps:
+      - name: Check environment configuration
+        # Names (never prints) anything missing before the droplet is
+        # touched, so a half-configured new environment fails here instead
+        # of mid-deploy after the rsync.
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MINEAI_GATEWAY_URL: ${{ secrets.MINEAI_GATEWAY_URL }}
+          MINEAI_GATEWAY_SECRET: ${{ secrets.MINEAI_GATEWAY_SECRET }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          missing=()
+          for name in SSH_PRIVATE_KEY ARK_AUTH_SECRET OPENAI_API_KEY \
+                      OPENROUTER_API_KEY MINEAI_GATEWAY_URL MINEAI_GATEWAY_SECRET \
+                      DEPLOY_HOST DEPLOY_USER DEPLOY_DOMAIN SSH_KNOWN_HOSTS; do
+            [[ -n ${!name:-} ]] || missing+=("$name")
+          done
+          if ((${#missing[@]})); then
+            echo "::error::GitHub environment $TARGET_ENV is missing: ${missing[*]} (deploy/scripts/provision.sh prints the setup)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/id"
+          chmod 600 "$RUNNER_TEMP/ssh/id"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          echo "SSH_OPTS=-i $RUNNER_TEMP/ssh/id -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+
+      - name: Rsync code to /opt/harness-ark
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        # --exclude .venv is load-bearing: the venv lives inside the code dir
+        # and ExecStart points at it; excluded paths are also protected from
+        # --delete. --chown=root:root keeps code root-owned so the ark user
+        # cannot self-modify the server.
+        run: |
+          rsync -az --delete --chown=root:root \
+            --exclude '.git' --exclude '.venv' \
+            --exclude '__pycache__' --exclude '.pytest_cache' \
+            --rsync-path='sudo rsync' \
+            -e "ssh $SSH_OPTS" \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:/opt/harness-ark/"
+
+      - name: Run remote deploy
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MINEAI_GATEWAY_URL: ${{ secrets.MINEAI_GATEWAY_URL }}
+          MINEAI_GATEWAY_SECRET: ${{ secrets.MINEAI_GATEWAY_SECRET }}
+        # Secrets travel over stdin: never argv (visible in `ps` on the VM),
+        # never a file that outlives the deploy. ssh propagates the remote
+        # exit status, so any deploy-remote.sh failure fails this step red.
+        run: |
+          umask 077
+          {
+            printf '%s=%s\n' ARK_AUTH_SECRET "$ARK_AUTH_SECRET"
+            printf '%s=%s\n' OPENAI_API_KEY "$OPENAI_API_KEY"
+            printf '%s=%s\n' OPENROUTER_API_KEY "$OPENROUTER_API_KEY"
+            printf '%s=%s\n' MINEAI_GATEWAY_URL "$MINEAI_GATEWAY_URL"
+            printf '%s=%s\n' MINEAI_GATEWAY_SECRET "$MINEAI_GATEWAY_SECRET"
+          } > "$RUNNER_TEMP/deploy.env"
+          # SSH_OPTS is a flag list: word splitting is intended.
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$DEPLOY_USER@$DEPLOY_HOST" \
+            'sudo /opt/harness-ark/deploy/deploy-remote.sh' \
+            < "$RUNNER_TEMP/deploy.env"
+          rm -f "$RUNNER_TEMP/deploy.env"
+
+      - name: External smoke test
+        env:
+          ARK_AUTH_SECRET: ${{ secrets.ARK_AUTH_SECRET }}
+          DEPLOY_DOMAIN: ${{ vars.DEPLOY_DOMAIN }}
+        # Exercises DNS + Caddy TLS + the WebSocket proxy path from the
+        # runner — the loopback health gate in deploy-remote.sh cannot.
+        run: |
+          pip install --quiet 'websockets>=13.0'
+          deploy/scripts/smoke.sh "$DEPLOY_DOMAIN"

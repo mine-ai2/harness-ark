@@ -4,7 +4,7 @@
 # Runs from OUTSIDE the VM (operator laptop or CI runner) against the
 # public domain, so it exercises DNS, the DO firewall, Caddy TLS, and the
 # WebSocket proxy path end to end. Also run post-deploy by
-# .github/workflows/talos-deploy.yml.
+# .github/workflows/talos-deploy-env.yml.
 #
 # Checks:
 #   1. https://<domain>/health returns {"ok": true} with a valid cert.
