@@ -52,12 +52,13 @@ Usage:
 
 <customer> is the customer slug: lowercase a-z, 0-9 and inner hyphens, at
 most 51 characters (e.g. `provision.sh acme` -> harness-acme,
-production-acme). development, production, harness and their "-..." forms
-are refused: they are environment/droplet names, not slugs.
+production-acme). development, production, harness (each also as "-..."),
+and prod-... are refused: they are environment/droplet names, not slugs.
 
 Options:
   --gh-env NAME   use NAME as the GitHub environment instead of the derived
-                  one (development/production stay reserved for dev/prod)
+                  one (same charset as a slug; development[-...] and
+                  production[-...] only when equal to the derived name)
   --dry-run       print every derived name and the setup checklist, then exit
                   before the first doctl call (same as PROVISION_DRY_RUN=1)
   -h, --help      show this help
@@ -113,11 +114,12 @@ case "$ENV_NAME" in
     ;;
 dev) GH_ENV=development ;;
 prod) GH_ENV=production ;;
-# Lookalikes: an operator pasting a GitHub environment or droplet name
-# instead of the slug would otherwise get production-production-acme /
+# Lookalikes: an operator pasting a GitHub environment (harness-ark
+# production-<c>, mine-capstone prod-<c>) or droplet name instead of the
+# slug would otherwise get production-production-acme / harness-prod-acme /
 # harness-harness-acme, or a second "production" harness
 # (harness-production) next to harness-prod that nothing deploys to.
-development | development-* | production | production-* | harness | harness-*)
+development | development-* | production | production-* | prod-* | harness | harness-*)
     die "'$ENV_NAME' is an environment or droplet name, not a slug: use dev, prod, or the bare customer slug (provision.sh acme)"
     ;;
 *)
@@ -133,19 +135,23 @@ development | development-* | production | production-* | harness | harness-*)
 esac
 
 if [[ -n $GH_ENV_OVERRIDE ]]; then
-    [[ $GH_ENV_OVERRIDE =~ ^[A-Za-z0-9._-]+$ ]] \
-        || die "invalid --gh-env '$GH_ENV_OVERRIDE': letters, digits, '.', '_' and '-' only"
+    # Same charset as slugs: it lands in API paths and pasteable commands.
+    [[ $GH_ENV_OVERRIDE =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+        || die "invalid --gh-env '$GH_ENV_OVERRIDE': lowercase a-z, 0-9 and inner hyphens only"
     # The printed setup commands overwrite the environment's SSH key and
-    # DEPLOY_HOST: aiming another droplet at development/production would
-    # re-point that environment's deploys.
-    case "$GH_ENV_OVERRIDE" in
-    development | production)
-        [[ $GH_ENV_OVERRIDE == "$GH_ENV" ]] \
-            || die "--gh-env $GH_ENV_OVERRIDE is reserved for $([[ $GH_ENV_OVERRIDE == development ]] && echo dev || echo prod)"
-        ;;
-    esac
+    # DEPLOY_HOST: aiming this droplet at development, production or another
+    # customer's production-<c> would re-point that environment's deploys.
+    # Those names are only ever reachable as the derived name itself.
+    if [[ $GH_ENV_OVERRIDE =~ ^(development|production)(-.*)?$ && $GH_ENV_OVERRIDE != "$GH_ENV" ]]; then
+        die "--gh-env $GH_ENV_OVERRIDE is reserved: development/production[-*] can only be the derived name ($GH_ENV here)"
+    fi
     GH_ENV="$GH_ENV_OVERRIDE"
 fi
+
+# Hostnames land in DNS records and pasteable commands: lowercase labels and
+# dots only (no quotes, spaces or $), like mine-capstone's render-app-spec.sh.
+HOST_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+[[ $DNS_ZONE =~ $HOST_RE ]] || die "invalid DNS_ZONE '$DNS_ZONE': expected a lowercase domain like mine.ai"
 
 DROPLET="harness-$ENV_NAME"
 VOLUME="$DROPLET-data"
@@ -157,6 +163,8 @@ KEYFILE="$HOME/.ssh/$DROPLET-deploy"
 # prod-<c> there). MINEAI_GATEWAY_URL / API_PUBLIC_BASE_URL are the app's
 # host ROOT: Ark appends /api/agent-gateway/... itself.
 APP_HOST="${APP_HOST:-$ENV_NAME.$DNS_ZONE}"
+[[ $APP_HOST =~ $HOST_RE ]] \
+    || die "invalid APP_HOST '$APP_HOST': a lowercase hostname without scheme or path (e.g. acme.mine.ai)"
 APP_GH_ENV="prod-$ENV_NAME"
 
 cat <<EOF
@@ -194,15 +202,17 @@ print_setup() {
 
 Configure GitHub environment $GH_ENV (protection rules first):
 
+EOF
+    if [[ $ENV_NAME != dev ]]; then
+        echo "  # <reviewer-user-id> below: gh api users/<login> --jq .id"
+    fi
+    cat <<EOF
+  # Skip the PUT when $GH_ENV already exists: a re-run would replace its
+  # protection rules (reviewer list). Check: gh api repos/mine-ai2/harness-ark/environments/$GH_ENV --jq '[.protection_rules[].type]'
   gh api -X PUT repos/mine-ai2/harness-ark/environments/$GH_ENV --input - <<'JSON'
 $ENV_BODY
 JSON
   gh api -X POST repos/mine-ai2/harness-ark/environments/$GH_ENV/deployment-branch-policies -f name=main -f type=branch
-EOF
-    if [[ $ENV_NAME != dev ]]; then
-        echo "  # <reviewer-user-id>: gh api users/<login> --jq .id"
-    fi
-    cat <<EOF
   gh secret set SSH_PRIVATE_KEY   --repo mine-ai2/harness-ark --env $GH_ENV < $KEYFILE
   gh variable set DEPLOY_HOST     --repo mine-ai2/harness-ark --env $GH_ENV --body "$IP"
   gh variable set DEPLOY_USER     --repo mine-ai2/harness-ark --env $GH_ENV --body "deploy"
@@ -220,16 +230,27 @@ EOF
         cat <<EOF
   ARK_AUTH_SECRET, MINEAI_GATEWAY_SECRET, MINEAI_GATEWAY_URL: the pairing block below
 
-Pair with the mine-capstone app (generate once, set in BOTH repos; values go
-over stdin, never argv):
+Pair with the mine-capstone app. PRECONDITION: the mine-capstone GitHub
+environment $APP_GH_ENV exists (create it first, with its required reviewer
+and deployment branches, per the mine-capstone new-customer runbook). The
+block checks both environments before generating anything, so it never sets
+one side only; on any failure re-run the WHOLE block (it regenerates and
+overwrites both sides). Values go over stdin, never argv:
 
-  ARK=\$(openssl rand -hex 32); GW=\$(openssl rand -hex 32)
-  printf '%s' "\$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env $APP_GH_ENV
-  printf '%s' "\$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env $GH_ENV
-  printf '%s' "\$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env $APP_GH_ENV
-  printf '%s' "\$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env $GH_ENV
-  gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env $GH_ENV --body "https://$APP_HOST"
-  unset ARK GW
+  if gh api repos/mine-ai2/mine-capstone/environments/$APP_GH_ENV --silent &&
+     gh api repos/mine-ai2/harness-ark/environments/$GH_ENV --silent; then
+    ARK=\$(openssl rand -hex 32); GW=\$(openssl rand -hex 32)
+    printf '%s' "\$ARK" | gh secret set HARNESS_ARK_SECRET     --repo mine-ai2/mine-capstone --env $APP_GH_ENV &&
+    printf '%s' "\$ARK" | gh secret set ARK_AUTH_SECRET        --repo mine-ai2/harness-ark   --env $GH_ENV &&
+    printf '%s' "\$GW"  | gh secret set HARNESS_GATEWAY_SECRET --repo mine-ai2/mine-capstone --env $APP_GH_ENV &&
+    printf '%s' "\$GW"  | gh secret set MINEAI_GATEWAY_SECRET  --repo mine-ai2/harness-ark   --env $GH_ENV &&
+    gh secret set MINEAI_GATEWAY_URL --repo mine-ai2/harness-ark --env $GH_ENV --body "https://$APP_HOST" &&
+    echo "paired: harness-ark $GH_ENV <-> mine-capstone $APP_GH_ENV" ||
+    echo "PAIRING INCOMPLETE: re-run this whole block" >&2
+    unset ARK GW
+  else
+    echo "nothing set: create mine-capstone env $APP_GH_ENV and harness-ark env $GH_ENV first" >&2
+  fi
 
   App side, not secret (mine-capstone .do/customers/$ENV_NAME.vars):
     HARNESS_ARK_URL="https://$FQDN"
