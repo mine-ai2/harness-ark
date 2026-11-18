@@ -34,6 +34,7 @@ from .types import (
     ToolResultEvent,
     TurnMetrics,
     TurnUsageEvent,
+    UserMessageInjected,
     UserText,
     message_from_row,
     message_to_row,
@@ -379,7 +380,11 @@ def elide_tool_results(
         return messages
     # The index of the user turn ``keep_turns`` from the end — everything at
     # or after it is protected.
-    user_indexes = [i for i, m in enumerate(messages) if isinstance(m, UserText)]
+    # Mid-turn input is NOT a turn boundary — counting it would shrink the
+    # protected tail inside the very turn that is still running.
+    user_indexes = [
+        i for i, m in enumerate(messages) if isinstance(m, UserText) and not m.mid_turn
+    ]
     protected_from = user_indexes[-keep_turns] if len(user_indexes) >= keep_turns else 0
     out: list[Message] = []
     for i, m in enumerate(messages):
@@ -605,7 +610,22 @@ async def run_user_turn(
     # Nothing is lost by excluding it: the tool's own ToolResult already
     # tells the model "shared <path> with the client (<n> bytes)".
     _llm_excluded = (SessionContext, TurnMetrics, RunError, SharedFile)
-    for _ in range(max_iterations):
+    for iteration in range(max_iterations):
+        if iteration:
+            # Mid-turn input: messages the user sent while this turn was
+            # running join the history here — after the previous
+            # iteration's tool results, before the next provider call — so
+            # the model reads them at its next step. Only drained when a
+            # provider call follows; leftovers at turn end are reported as
+            # `done.undelivered` by run_and_publish, never silently dropped.
+            for queued in _drain_inbox(session_id):
+                append_message(
+                    conn, session_id, UserText(text=queued["text"], mid_turn=True)
+                )
+                yield UserMessageInjected(
+                    text=queued["text"],
+                    client_message_id=queued["client_message_id"],
+                )
         history = load_history(conn, session_id)
         contexts = [m for m in history if isinstance(m, SessionContext)]
         turn_messages = [m for m in history if not isinstance(m, _llm_excluded)]
@@ -747,9 +767,51 @@ async def run_user_turn(
 # session_id -> the asyncio.Task driving its in-flight turn. Registered by
 # run_and_publish itself (asyncio.current_task on entry), so every spawn
 # site — the WS handler, the scheduler — gets stop support without changes.
-# Ark has no per-session concurrency guard; if a client violates the
-# one-turn-at-a-time protocol the newest turn owns the slot.
+# A `user_message` for a session whose turn is running is queued into that
+# turn (mid-turn input, `enqueue_user_message`) — the WS handler never spawns
+# a second concurrent turn for one session. Other spawn sites (the
+# scheduler) still follow "the newest turn owns the slot".
 _active_turns: dict[str, "asyncio.Task"] = {}
+
+
+# session_id -> user messages that arrived while that session's turn was
+# running (mid-turn input). Drained by run_user_turn between tool iterations;
+# whatever is left when the turn ends is reported on the terminal frame as
+# `undelivered` and cleared — the CLIENT decides whether to send it as the
+# next turn (Ark never auto-starts one).
+_turn_inboxes: dict[str, list[dict]] = {}
+
+
+def turn_running(session_id: str) -> bool:
+    task = _active_turns.get(session_id)
+    return task is not None and not task.done()
+
+
+def enqueue_user_message(
+    session_id: str, text: str, client_message_id: str | None = None
+) -> bool:
+    """Queue ``text`` for the session's RUNNING turn. Returns False when no
+    turn is running — the caller then starts a turn as usual (never a second
+    concurrent turn for one session)."""
+    if not turn_running(session_id):
+        return False
+    _turn_inboxes.setdefault(session_id, []).append(
+        {"client_message_id": client_message_id, "text": text}
+    )
+    return True
+
+
+def _drain_inbox(session_id: str) -> list[dict]:
+    return _turn_inboxes.pop(session_id, [])
+
+
+def _close_turn(session_id: str, task) -> list[dict]:
+    """Unregister the turn, THEN take its leftovers — in that order, with
+    no await between, so a message arriving afterwards starts a fresh turn
+    instead of landing in an inbox nobody drains."""
+    if task is not None and _active_turns.get(session_id) is task:
+        del _active_turns[session_id]
+    return _drain_inbox(session_id)
 
 
 def stop_turn(session_id: str) -> bool:
@@ -808,6 +870,12 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
         return {"type": "error", "code": evt.code, "message": evt.message}
     if isinstance(evt, RunEnd):
         return {"type": "done", "stop_reason": evt.stop_reason}
+    if isinstance(evt, UserMessageInjected):
+        return {
+            "type": "user_message_injected",
+            "client_message_id": evt.client_message_id,
+            "text": evt.text,
+        }
     if is_dataclass(evt):
         return {"type": type(evt).__name__, **asdict(evt)}
     return {"type": "unknown"}
@@ -843,35 +911,46 @@ async def run_and_publish(
             wire = event_to_wire(evt)
             wire["session_id"] = session_id
             wire["agent_name"] = agent.name
+            if isinstance(evt, RunEnd):
+                # Terminal frame: close the turn first (later messages start
+                # a new turn), then report what never reached the model.
+                undelivered = _close_turn(session_id, task)
+                if undelivered:
+                    wire["undelivered"] = undelivered
             broker.publish(session_id, wire)
     except asyncio.CancelledError:
         # Real mid-turn cancel (`stop`, mine-capstone#485): close the turn
         # with a terminal event so clients aren't left mid-stream, then let
         # the cancellation land (the task ends cancelled).
-        broker.publish(
-            session_id,
-            {
-                "type": "done",
-                "stop_reason": "stopped",
-                "stopped": True,
-                "session_id": session_id,
-                "agent_name": agent.name,
-            },
-        )
+        frame = {
+            "type": "done",
+            "stop_reason": "stopped",
+            "stopped": True,
+            "session_id": session_id,
+            "agent_name": agent.name,
+        }
+        undelivered = _close_turn(session_id, task)
+        if undelivered:
+            frame["undelivered"] = undelivered
+        broker.publish(session_id, frame)
         raise
     except Exception as e:  # noqa: BLE001
         # run_user_turn catches provider exceptions itself; this is for anything
         # that escapes (programming errors, broker failures, etc.).
-        broker.publish(
-            session_id,
-            {
-                "type": "error",
-                "session_id": session_id,
-                "agent_name": agent.name,
-                "code": "other",
-                "message": f"{type(e).__name__}: {e}",
-            },
-        )
+        frame = {
+            "type": "error",
+            "session_id": session_id,
+            "agent_name": agent.name,
+            "code": "other",
+            "message": f"{type(e).__name__}: {e}",
+        }
+        undelivered = _close_turn(session_id, task)
+        if undelivered:
+            frame["undelivered"] = undelivered
+        broker.publish(session_id, frame)
     finally:
         if task is not None and _active_turns.get(session_id) is task:
             del _active_turns[session_id]
+            # Unreachable in practice (every exit path above closes the
+            # turn); never leave a stale inbox behind a dead turn.
+            _turn_inboxes.pop(session_id, None)
