@@ -140,6 +140,15 @@ class _Ui:
         sys.stderr.write(f"\033[31m{text}\033[0m\n")
         sys.stderr.flush()
 
+    def note_line(self, text: str) -> None:
+        """A dim informational line (not an error)."""
+        self._wipe_status()
+        if self.text_pending_newline:
+            sys.stdout.write("\n")
+            self.text_pending_newline = False
+        sys.stderr.write(f"\033[2m{text}\033[0m\n")
+        sys.stderr.flush()
+
     def usage(
         self,
         input_tokens: int,
@@ -237,7 +246,12 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             ui.error_line(f"[auth failure — check your provider API key. {msg[:120]}]")
         else:
             ui.error_line(f"[server error: {msg}]")
+    elif t == "user_message_injected":
+        ui.note_line(f"[↳ delivered mid-turn: {_truncate(evt.get('text') or '', 80)}]")
+        ui.status("thinking")
     elif t == "done":
+        for left in evt.get("undelivered") or []:
+            ui.note_line(f"[not delivered this turn: {_truncate(left.get('text') or '', 80)}]")
         ui.done()
 
 

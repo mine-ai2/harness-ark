@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — mid-turn input
+
+- **`user_message` while a turn runs is injected, not a second turn.** The
+  WS handler queues it into the running turn (per-session inbox); the
+  runtime drains the queue after each tool-results batch, before the next
+  provider call — persisted as `UserText` with `mid_turn: true` (also in
+  `/history` + catch-up `data`; turn starts carry `false`), announced as
+  `user_message_injected {client_message_id, text}`. Optional
+  `client_message_id` on `user_message` is echoed back.
+- **`done.undelivered`**: queued messages that never reached the model
+  (plain-text end, `max_iterations`, error, `stop`) are listed on the
+  terminal frame and cleared — Ark never auto-starts a follow-on turn.
+- Turn tasks are registered synchronously at spawn, closing a window where
+  two buffered `user_message`s could start two concurrent turns.
+- Anthropic/Gemini adapters fold text that follows tool results into the
+  same user turn; tool-result elision does not count `mid_turn` text as a
+  turn boundary.
+- `GET /health` → `{"ok": true, "features": ["mid_turn_input"]}`; the CLI
+  viewer prints delivered / undelivered mid-turn messages.
+
 ## Unreleased — context efficiency: named blocks, tool-result elision, prompt caching
 
 Port of the upstream context-efficiency PR

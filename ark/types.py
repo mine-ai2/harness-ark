@@ -18,6 +18,9 @@ from typing import Any, Union
 @dataclass
 class UserText:
     text: str
+    # True when this text arrived WHILE a turn was running and was injected
+    # between tool iterations (mid-turn input) — not the start of a turn.
+    mid_turn: bool = False
 
 
 @dataclass
@@ -235,6 +238,18 @@ class RunErrorEvent:
     message: str
 
 
+@dataclass
+class UserMessageInjected:
+    """A user message that arrived WHILE the turn was running (mid-turn
+    input) and was just drained into the model's history — after a
+    tool-results batch, before the next provider call. ``client_message_id``
+    echoes the id the client sent with its ``user_message`` (None if it sent
+    none)."""
+
+    text: str
+    client_message_id: str | None = None
+
+
 ProviderEvent = Union[
     TextDelta, ThinkingDelta, ToolCallEvent, AssistantTurnEnd, TurnUsageEvent
 ]
@@ -247,6 +262,7 @@ RuntimeEvent = Union[
     RunEnd,
     TurnUsageEvent,
     RunErrorEvent,
+    UserMessageInjected,
 ]
 
 
@@ -258,7 +274,10 @@ RuntimeEvent = Union[
 def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
     """Return (role, content_dict) for storage."""
     if isinstance(msg, UserText):
-        return "user", {"text": msg.text}
+        body: dict[str, Any] = {"text": msg.text}
+        if msg.mid_turn:
+            body["mid_turn"] = True
+        return "user", body
     if isinstance(msg, AssistantText):
         body: dict[str, Any] = {"text": msg.text}
         if msg.injected_from:
@@ -315,7 +334,7 @@ def message_to_row(msg: Message) -> tuple[str, dict[str, Any]]:
 
 def message_from_row(role: str, content: dict[str, Any]) -> Message:
     if role == "user":
-        return UserText(text=content["text"])
+        return UserText(text=content["text"], mid_turn=bool(content.get("mid_turn")))
     if role == "assistant":
         return AssistantText(text=content["text"], injected_from=content.get("injected_from"))
     if role == "tool_call":

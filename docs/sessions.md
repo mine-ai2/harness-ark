@@ -201,8 +201,9 @@ right session.
 | `turn_usage` | `input_tokens`, `output_tokens`, `model`, `context_window` | Per-turn token counts (`context_window` is null if unknown). See [Usage tracking](#usage-tracking) below. |
 | `file_available` | `path`, `description`, `size` | Agent shared a file (see [files.md](files.md)) |
 | `injected_message` | `from_session_id`, `text` | Another session injected a message via `post_to_session` |
+| `user_message_injected` | `client_message_id`, `text` | A `user_message` sent while this session's turn was running was just added to the model's history (after a tool-results batch, before the next provider call). See [Mid-turn input](#mid-turn-input). |
 | `error` | `code`, `message` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
-| `done` | `stop_reason` | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`. |
+| `done` | `stop_reason`, `undelivered`? | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`; after `stop`, `stopped: true` and `stop_reason: "stopped"`. `undelivered` (omitted when empty) lists mid-turn messages that never reached the model: `[{"client_message_id", "text"}]`. |
 
 Every event also carries `session_id` and (except for the broad "error" case
 where the session couldn't be identified) `agent_name`.
@@ -211,11 +212,33 @@ where the session couldn't be identified) `agent_name`.
 
 | Command | Required fields | Effect |
 |---|---|---|
-| `user_message` | `session_id`, `text` | Start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. |
-| `stop` | `session_id` | Request cancellation (v1: no-op — see design.md §6). |
+| `user_message` | `session_id`, `text` (optional `client_message_id`: string) | No turn running → start a new turn in that session. Multiple sessions can have turns running concurrently — events stream back tagged with their `session_id`. A turn already running for the session → the message is queued INTO that turn ([Mid-turn input](#mid-turn-input)); a session never has two concurrent turns from this command. |
+| `stop` | `session_id` | Cancel the running turn: the turn publishes `done {"stopped": true}` (with `undelivered` for queued mid-turn input) and any in-flight `run_command` process group is terminated. No running turn → silent no-op. |
 
 Per-session context is **not** added over the WS — it's a REST operation
 even mid-chat. The CLI does the REST call when you type `/context ...`.
+
+### Mid-turn input
+
+A `user_message` that arrives while the session's turn is running is
+queued into that turn instead of starting another one. After each
+tool-results batch — right before the next provider call — the runtime
+drains the queue in arrival order: each message is persisted as a
+`UserText` at that point in history with `"mid_turn": true` (so `/history`
+and catch-up can tell it from a turn start, whose `mid_turn` is `false`)
+and announced with `user_message_injected`, echoing the client's
+`client_message_id`. Provider adapters fold that text
+into the same user turn as the tool results (Anthropic/Gemini) or send it
+as the next `user` message (OpenAI-compatible), so the model reads it at
+its next step.
+
+Messages still queued when the turn ends — the model answered without
+another tool call, hit `max_iterations`, errored, or was stopped — are
+**not** run automatically: the terminal `done` (or the unclassified
+`error` frame) lists them in `undelivered`, and the client decides whether
+to send them as the next turn. A message that arrives after the turn has
+closed starts a new turn as usual. `GET /health` advertises the capability
+as `"features": ["mid_turn_input"]`.
 
 ### Cross-session catch-up
 

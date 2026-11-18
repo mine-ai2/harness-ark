@@ -238,6 +238,14 @@ def to_anthropic_messages(messages: list[Message]) -> list[dict[str, Any]]:
                     block["is_error"] = True
                 blocks.append(block)
                 i += 1
+            # Mid-turn input lands right after a tool-results batch: fold it
+            # into the SAME user message (tool_result blocks first, then
+            # text — the canonical shape) instead of a second consecutive
+            # user turn.
+            while i < n and isinstance(messages[i], UserText):
+                if messages[i].text:
+                    blocks.append({"type": "text", "text": messages[i].text})
+                i += 1
             out.append({"role": "user", "content": blocks})
         else:  # pragma: no cover
             raise TypeError(f"unknown message: {type(m).__name__}")
@@ -459,7 +467,10 @@ def _mark_openrouter_cache(api_messages: list[dict[str, Any]]) -> None:
 
 
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
-    """Fold flat messages into OpenAI chat-completions shape."""
+    """Fold flat messages into OpenAI chat-completions shape.
+
+    Mid-turn input (a UserText right after `tool` messages) needs no folding:
+    `tool` → `user` is a legal chat-completions sequence."""
 
     out: list[dict[str, Any]] = []
     if system:
@@ -720,6 +731,13 @@ def to_google_contents(messages: list[Message]) -> list[Any]:
                         )
                     )
                 )
+                i += 1
+            # Mid-turn input right after the results: same user Content
+            # (function_response parts, then text) — Gemini expects roles to
+            # alternate, so never a second consecutive user Content.
+            while i < n and isinstance(messages[i], UserText):
+                if messages[i].text:
+                    parts.append(gtypes.Part(text=messages[i].text))
                 i += 1
             out.append(gtypes.Content(role="user", parts=parts))
         else:  # pragma: no cover

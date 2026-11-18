@@ -63,7 +63,10 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"ok": True}
+        # `features` lets clients detect optional protocol capabilities
+        # without version sniffing (mid_turn_input: a user_message sent
+        # while a turn runs is injected into it — see docs/sessions.md).
+        return {"ok": True, "features": ["mid_turn_input"]}
 
     @app.get("/agents")
     def list_agents():
@@ -887,18 +890,40 @@ def create_app(config: Config) -> FastAPI:
                         }
                     )
                     continue
+                text = cmd.get("text", "")
+                client_message_id = cmd.get("client_message_id")
+                if client_message_id is not None and not isinstance(client_message_id, str):
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "session_id": sid,
+                            "code": "other",
+                            "message": "`client_message_id` must be a string",
+                        }
+                    )
+                    continue
+                # Mid-turn input: a turn is already running for this session
+                # → queue the message INTO that turn (drained between tool
+                # iterations; leftovers come back on `done.undelivered`).
+                # Never a second concurrent turn for one session.
+                if runtime.enqueue_user_message(sid, text, client_message_id):
+                    continue
                 # Spawn the turn as a background task — multiple sessions can
                 # have turns running concurrently. Their events all flow back
-                # through this same WS via the broker subscription.
-                asyncio.create_task(
+                # through this same WS via the broker subscription. Registered
+                # HERE, synchronously: the task only self-registers once it
+                # first runs, and a second buffered `user_message` can be read
+                # before that — it must see the turn as running.
+                task = asyncio.create_task(
                     runtime.run_and_publish(
                         conn=conn,
                         config=config,
                         agent=agent,
                         session_id=sid,
-                        user_text=cmd.get("text", ""),
+                        user_text=text,
                     )
                 )
+                runtime._active_turns[sid] = task
         except WebSocketDisconnect:
             return
         finally:
