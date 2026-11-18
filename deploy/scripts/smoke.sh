@@ -7,7 +7,8 @@
 # .github/workflows/talos-deploy.yml.
 #
 # Checks:
-#   1. https://<domain>/health returns {"ok": true} with a valid cert.
+#   1. https://<domain>/health returns {"ok": true, ...} with a valid cert
+#      (extra keys such as "features" are allowed).
 #   2. wss://<domain>/events rejects an unauthenticated connect.
 #   3. wss://<domain>/events accepts the bearer token and answers an
 #      application-level round-trip (the server sends nothing on connect,
@@ -51,7 +52,9 @@ body="$(curl -fsS --max-time 10 "https://$DOMAIN/health")" \
     || die "GET https://$DOMAIN/health failed"
 python3 - "$body" <<'PY' || die "/health did not return {\"ok\": true}"
 import json, sys
-assert json.loads(sys.argv[1]) == {"ok": True}
+# Additive keys (e.g. "features": ["mid_turn_input"], PR #24) must not fail
+# the smoke: only the liveness bit is the contract.
+assert json.loads(sys.argv[1]).get("ok") is True
 PY
 ok "https://$DOMAIN/health returns {\"ok\": true} with valid TLS"
 
