@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from .shell_guard import detach_reason
 from .types import ToolSchema
 
 if TYPE_CHECKING:
@@ -159,7 +160,22 @@ def stop_session_commands(session_id: str) -> int:
     return len(procs)
 
 
+_DETACH_TEACHING = (
+    "run_command runs in the foreground for up to 600 s and may not leave a "
+    "process behind: {reason} would detach it, so it would outlive the turn "
+    "and ignore Stop. Nothing was started. For long jobs, chunk the work into "
+    "commands that each finish (raise timeout_seconds up to 600), run parallel "
+    "steps as `a & b & wait`, or ask MineAI for a bulk tool. If the `&` is part "
+    "of a URL or an argument, quote it."
+)
+
+
 def _run_command(*, command: str, timeout_seconds: float = 60) -> str:
+    # Refuse before spawning (mine-capstone#1418): `stop` and the timeout
+    # kill the process group, which setsid/nohup/a background `&` escape.
+    reason = detach_reason(command)
+    if reason:
+        raise ToolError(_DETACH_TEACHING.format(reason=reason))
     timeout = min(float(timeout_seconds), 600)
     ctx = _context.get(None)
     session_id = ctx.session_id if ctx is not None else None
@@ -241,7 +257,12 @@ _register(
 _register(
     ToolSchema(
         name="run_command",
-        description="Run a shell command and return stdout, stderr, and exit code.",
+        description=(
+            "Run a shell command and return stdout, stderr, and exit code. "
+            "Runs in the foreground (default 60 s, max 600 s): detaching "
+            "(setsid, nohup, disown, screen, tmux, systemd-run, crontab, at, "
+            "a background `&` without `wait`) is rejected."
+        ),
         input_schema={
             "type": "object",
             "properties": {

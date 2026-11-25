@@ -20,6 +20,24 @@
 - `GET /health` → `{"ok": true, "features": ["mid_turn_input"]}`; the CLI
   viewer prints delivered / undelivered mid-turn messages.
 
+## Unreleased — `run_command` detach prevention
+
+- **`run_command` refuses commands that detach** (mine-capstone#1418). A
+  detached loop outlived its turn by 13 minutes in production and ignored
+  `stop`, because `stop` signals the command's process group and `setsid`
+  leaves it. Before spawning, the command is scanned (`ark/shell_guard.py`)
+  and rejected with a teaching `ToolError` when it uses `setsid`, `nohup`,
+  `disown`, `screen`, `tmux`, `systemd-run`, `crontab` or `at` as a command
+  (also by path, behind `sudo` / `env` / `timeout` / `xargs`, inside
+  `sh -c '…'`, `eval` or a here-doc fed to a shell), or a background `&`
+  that is not reaped by a later top-level `wait`.
+- Still allowed: `&&`, `|&`, `2>&1`, `>&2`, `&>`, `&` inside quotes,
+  arithmetic `$(( a & b ))`, here-doc bodies fed to non-shell programs, and
+  the parallel idiom `a & b & wait`.
+- The scan is a guard against model habits, not a sandbox: a script written
+  to disk and then run is not inspected (cgroup kill is mine-capstone#1434).
+  Rules and examples: `docs/tools.md`.
+
 ## Unreleased — context efficiency: named blocks, tool-result elision, prompt caching
 
 Port of the upstream context-efficiency PR
