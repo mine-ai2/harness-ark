@@ -52,8 +52,9 @@ body="$(curl -fsS --max-time 10 "https://$DOMAIN/health")" \
     || die "GET https://$DOMAIN/health failed"
 python3 - "$body" <<'PY' || die "/health did not return {\"ok\": true}"
 import json, sys
-# Additive keys (e.g. "features": ["mid_turn_input"], PR #24) must not fail
-# the smoke: only the liveness bit is the contract.
+# Additive keys (e.g. "features": ["mid_turn_input", "max_iterations_override"],
+# PRs #24 / mine-capstone#1423) must not fail the smoke: only the liveness bit
+# is the contract. Pinned by tests/test_max_iterations.py.
 assert json.loads(sys.argv[1]).get("ok") is True
 PY
 ok "https://$DOMAIN/health returns {\"ok\": true} with valid TLS"

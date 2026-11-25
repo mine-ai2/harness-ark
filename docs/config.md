@@ -253,6 +253,8 @@ Each agent is keyed by name. The name is what you use everywhere — CLI
 | `workspace` | string | no | Absolute path the agent treats as its working directory. Defaults to `<ARK_HOME>/agents/<name>/workspace`. `~` is expanded. |
 | `always_loaded_skills` | string[] | no | Names of skills whose tool schemas are exposed on every session start. Skills not in this list are still discoverable via `list_skills()` / `load_skill()`. |
 | `max_context_tokens` | int | no | Override the model's input-token ceiling for the usage indicator. Falls back to the table in [ark/models.py](../ark/models.py). Set when you want to override the default (e.g. opt into Anthropic's 1M-token beta — `1000000`) or when the model isn't in the table. |
+| `max_iterations` | int | no | Tool-loop ceiling per user turn: how many provider calls one turn may make before it ends with `done.stop_reason: "max_iterations"`. Default `16`. A session may raise it — see [sessions.md](sessions.md#advisory-modeleffort-overrides). |
+| `max_iterations_ceiling` | int | no | The most a session's `metadata.max_iterations` (or `effort`) may raise `max_iterations` to. Default `64` (or `max_iterations`, when that is larger); must be ≥ `max_iterations`. |
 | `mcp_servers` | string[] | no | Names of MCP servers this agent may access. Every name must appear in top-level `mcp_servers`. Servers not listed here are invisible to the agent — a per-agent access whitelist. See [mcp.md](mcp.md). |
 | `always_loaded_mcp_servers` | string[] | no | Subset of `mcp_servers` whose tools are exposed on every turn without requiring the agent to call `load_skill` first. Mirrors `always_loaded_skills` for MCP-backed tools. |
 

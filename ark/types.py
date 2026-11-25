@@ -209,9 +209,16 @@ class AssistantTurnEnd:
 
 @dataclass
 class RunEnd:
-    """End of the whole run loop (no more tool calls — the agent is done)."""
+    """End of the whole run loop (no more tool calls — the agent is done).
+
+    `iterations` is the number of provider calls the turn made and
+    `max_iterations` the effective ceiling it ran under (mine-capstone#1423);
+    both ride the terminal `done` frame so a client can say "stopped at the
+    tool-step limit (N)" instead of ending silently."""
 
     stop_reason: str | None = None
+    iterations: int | None = None
+    max_iterations: int | None = None
 
 
 @dataclass

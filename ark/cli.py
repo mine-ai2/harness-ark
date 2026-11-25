@@ -250,6 +250,12 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
         ui.note_line(f"[↳ delivered mid-turn: {_truncate(evt.get('text') or '', 80)}]")
         ui.status("thinking")
     elif t == "done":
+        if evt.get("stop_reason") == "max_iterations":
+            limit = evt.get("max_iterations")
+            where = f" ({limit})" if limit else ""
+            ui.note_line(
+                f"[stopped at the tool-step limit{where} — send a message to continue]"
+            )
         for left in evt.get("undelivered") or []:
             ui.note_line(f"[not delivered this turn: {_truncate(left.get('text') or '', 80)}]")
         ui.done()

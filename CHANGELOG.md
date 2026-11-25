@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — configurable tool-loop ceiling (mine-capstone#1423)
+
+- **`agents.<name>.max_iterations`** (default `16`) replaces the hard-coded
+  per-turn tool-loop ceiling; **`agents.<name>.max_iterations_ceiling`**
+  (default `64`) bounds what a session may ask for. The Talos deploy
+  template sets `32` / `64`.
+- **Session `metadata.max_iterations`** is honoured like `effort`: a
+  positive integer only ever RAISES the configured value, clamped to the
+  agent's ceiling; anything else is ignored. `effort: high` (32) keeps
+  working — the turn takes the largest of the three, under the ceiling.
+- **`done.iterations` / `done.max_iterations`**: every terminal `done`
+  (plain-text end, `max_iterations`, classified error, `stop`) now reports
+  the provider calls the turn made and the ceiling it ran under, so clients
+  can render "stopped at the tool-step limit (N)". Additive keys.
+- `GET /health` → `"features": ["mid_turn_input", "max_iterations_override"]`.
+  `deploy/scripts/smoke.sh` already tolerates additive features (PR #25); a
+  test now pins that against the new body.
+
 ## Unreleased — mid-turn input
 
 - **`user_message` while a turn runs is injected, not a second turn.** The
