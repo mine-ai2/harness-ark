@@ -128,6 +128,61 @@ def test_run_command_timeout(tmp_path):
     assert "timed out" in output
 
 
+def test_run_command_rejects_detach_before_spawning(tmp_path, monkeypatch):
+    """mine-capstone#1418: a detaching command gets a teaching error and
+    nothing is spawned — Popen is never reached and the side effect the
+    command would have had does not happen."""
+    ctx = make_ctx(tmp_path)
+    marker = tmp_path / "spawned"
+    spawned = []
+    real_popen = tools.subprocess.Popen
+
+    def spy(*args, **kwargs):
+        spawned.append(args)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(tools.subprocess, "Popen", spy)
+    for command in (
+        f"setsid sh -c 'touch {marker}; sleep 100' &",
+        f"nohup sh -c 'touch {marker}' > /dev/null 2>&1 &",
+        f"touch {marker}; sleep 100 &",
+        f"bash -c 'touch {marker}; sleep 100 &'",
+    ):
+        output, err = run("run_command", {"command": command}, ctx)
+        assert err is True, command
+        assert "foreground" in output and "Nothing was started" in output
+        assert "chunk the work" in output and "bulk tool" in output
+    assert spawned == []
+    assert not marker.exists()
+
+
+def test_run_command_names_the_detach_construct(tmp_path):
+    ctx = make_ctx(tmp_path)
+    output, _ = run("run_command", {"command": "setsid sleep 100 &"}, ctx)
+    assert "`setsid`" in output
+    output, _ = run("run_command", {"command": "sleep 100 &"}, ctx)
+    assert "a background `&`" in output
+
+
+def test_run_command_still_runs_chains_and_redirects(tmp_path):
+    ctx = make_ctx(tmp_path)
+    output, err = run("run_command", {"command": "echo a && echo b"}, ctx)
+    assert err is False and "a\nb" in output
+    output, err = run("run_command", {"command": "ls /nonexistent-1418 2>&1"}, ctx)
+    assert err is False and "--- stdout ---" in output and "--- stderr ---" not in output
+    output, err = run("run_command", {"command": 'echo "a & b" 2>&1 | cat'}, ctx)
+    assert err is False and "a & b" in output
+    output, err = run(
+        "run_command", {"command": "(sleep 0.1; echo one) & echo two & wait"}, ctx
+    )
+    assert err is False and "one" in output and "two" in output
+
+
+def test_run_command_description_states_the_foreground_rule():
+    schema = next(s for s in tools.schemas() if s.name == "run_command")
+    assert "foreground" in schema.description and "setsid" in schema.description
+
+
 def test_unknown_tool(tmp_path):
     ctx = make_ctx(tmp_path)
     output, err = run("nope", {}, ctx)

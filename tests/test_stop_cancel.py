@@ -176,6 +176,33 @@ async def test_stop_session_commands_kills_the_process_group(ark_home, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_rejected_detach_leaves_no_survivor(ark_home, tmp_path):
+    """mine-capstone#1418: `setsid … &` escaped the process group that `stop`
+    signals. It is now refused before spawning, so there is nothing for
+    `stop` to miss: no registered process, no survivor in `ps`."""
+    cfg = make_config(tmp_path / "ws")
+    (tmp_path / "ws").mkdir()
+    ctx = tools.ToolContext(
+        conn=None,
+        config=cfg,
+        agent=cfg.agents["scribe"],
+        session_id="s-detach",
+        cwd=tmp_path / "ws",
+        loaded_skills=set(),
+    )
+    duration = "100.1418"  # a sleep argument unique enough to find in ps
+    output, is_error = await tools.execute(
+        "run_command", {"command": f"setsid sleep {duration} &"}, ctx=ctx
+    )
+    assert is_error
+    assert "`setsid`" in output and "ignore Stop" in output
+    assert not tools._active_procs.get("s-detach")
+    assert tools.stop_session_commands("s-detach") == 0
+    ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True)
+    assert f"sleep {duration}" not in ps.stdout
+
+
+@pytest.mark.asyncio
 async def test_run_and_publish_registers_and_cleans_registry(
     ark_home, tmp_path, monkeypatch
 ):

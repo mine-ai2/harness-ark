@@ -140,7 +140,7 @@ All built-in tools run with the privileges of the Ark server process. There is *
 | `read_file(path)` | Read any file on the filesystem accessible to the server process. |
 | `write_file(path, content)` | Write any file. Creates parent dirs. |
 | `list_files(path, pattern?)` | List/glob files. |
-| `run_command(cmd, timeout_seconds=60)` | Run a shell command. Default timeout 60s, max 600s. Killed on `stop`. |
+| `run_command(cmd, timeout_seconds=60)` | Run a shell command in the foreground. Default timeout 60s, max 600s. Killed on `stop`. Commands that detach (`setsid`, `nohup`, a background `&`, …) are rejected before spawning — see [docs/tools.md](../docs/tools.md). |
 | `search_web(query)` | Brave Search API. |
 | `post_to_session(session_id, body)` | Inject a message into another session owned by the same agent. See §8. |
 | `list_my_sessions(kind?, limit?)` | List sessions owned by the current agent, most recent first. |
