@@ -73,6 +73,40 @@ def test_skill_exposes_exactly_two_tools(skill):
     assert schema.input_schema["required"] == ["name", "arguments"]
 
 
+def test_proxy_tool_schemas_are_pinned(skill):
+    """mine-capstone#1419: PEP 604 optionals used to collapse to `string`
+    (`options`, `names`), and only the docstring's first paragraph reached
+    the model."""
+    from ark.skills import _TOOL_ATTR
+
+    call = getattr(skill.mineai_call_tool, _TOOL_ATTR)
+    assert call.input_schema == {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "arguments": {"type": "object"},
+            "options": {"type": "object"},
+        },
+        "required": ["name", "arguments"],
+    }
+    listing = getattr(skill.mineai_list_tools, _TOOL_ATTR)
+    assert listing.input_schema == {
+        "type": "object",
+        "properties": {
+            "pack": {"type": "string"},
+            "names": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+    for word in ("remediation", "retryable", "replayed", "_compaction", "options", "full"):
+        assert word in call.description, word
+    assert "attached: false" in call.description
+    assert "pack" in listing.description and "names" in listing.description
+    # Model-facing text: no issue references, and a size the prompt can afford.
+    for schema in (call, listing):
+        assert "mine-capstone#" not in schema.description
+        assert len(schema.description.encode()) < 1024
+
+
 def test_list_tools_posts_session_id_with_secret_header(skill, tool_context, monkeypatch):
     seen = {}
 
@@ -302,6 +336,45 @@ def test_agent_image_is_fetched_and_embedded_in_band(skill, tool_context, monkey
         "data_b64": base64.b64encode(b"\x89PNG-bytes").decode("ascii"),
     }]
     assert out["result"]["agent_image"] == {"attached": True, "media_type": "image/png"}
+
+
+def _with_provider(tool_context, provider_type):
+    tool_context.agent.provider = "main"
+    tool_context.config.providers = {"main": SimpleNamespace(provider_type=provider_type)}
+
+
+def test_agent_image_attaches_on_a_provider_that_carries_images(
+    skill, tool_context, monkeypatch
+):
+    _with_provider(tool_context, "anthropic")
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Response(200, _satellite_body()))
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _PngResponse())
+    out = json.loads(skill.mineai_call_tool(name="map.satellite", arguments={}))
+    assert out["result"]["agent_image"] == {"attached": True, "media_type": "image/png"}
+    assert len(out["__ark_images__"]) == 1
+
+
+@pytest.mark.parametrize("provider_type", ["openrouter", "openai", "google"])
+def test_agent_image_is_reported_unattached_when_the_provider_cannot_carry_it(
+    skill, tool_context, monkeypatch, provider_type
+):
+    """mine-capstone#1419: the OpenRouter path drops ToolResult.images, so
+    the result must not claim `attached: true` — and the bytes are not
+    fetched at all."""
+    _with_provider(tool_context, provider_type)
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Response(200, _satellite_body()))
+
+    def never_get(*a, **k):  # pragma: no cover — must not be called
+        raise AssertionError("no image fetch expected")
+
+    monkeypatch.setattr(httpx, "get", never_get)
+    out = json.loads(skill.mineai_call_tool(name="map.satellite", arguments={}))
+    assert "__ark_images__" not in out
+    image = out["result"]["agent_image"]
+    assert image["attached"] is False
+    assert provider_type in image["note"] and "text only" in image["note"]
+    assert "\n" not in image["note"]  # a one-line reason
+    assert out["result"]["render_id"] == "r-1"  # the rest of the result is intact
 
 
 def test_agent_image_fetch_failure_degrades_to_text(skill, tool_context, monkeypatch):

@@ -65,6 +65,25 @@ def test_fold_tool_result_error_prefixed():
     assert out[0]["content"].startswith("ERROR:")
 
 
+def test_tool_result_images_do_not_reach_openai_style_models():
+    """mine-capstone#1419: the OpenAI-compatible translator (OpenAI and
+    OpenRouter) sends a tool result as text only. This pins the fact the
+    `carries_tool_result_images` table states — if images are ever carried
+    here, flip the table in the same change so the proxy skill stops saying
+    `attached: false`."""
+    from ark.provider import carries_tool_result_images, to_google_contents
+
+    result = ToolResult(
+        call_id="t1", output="{}", images=[{"media_type": "image/png", "data_b64": "QUJD"}]
+    )
+    out = to_openai_messages("", [result])
+    assert out == [{"role": "tool", "tool_call_id": "t1", "content": "{}"}]
+    assert "QUJD" not in repr(to_google_contents([result]))
+    assert carries_tool_result_images("anthropic") is True
+    for provider_type in ("openrouter", "openai", "google"):
+        assert carries_tool_result_images(provider_type) is False
+
+
 def test_tool_schema_conversion():
     s = ToolSchema(
         name="read_file",

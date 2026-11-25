@@ -51,6 +51,26 @@ have.
   `turn_usage` wire events, and the CLI's usage line (`% cached`).
 - kimi-k3 added to the context-window table (256k).
 
+## Unreleased — proxy-skill schema fixes
+
+- **`@tool` understands PEP 604 unions** (mine-capstone#1419).
+  `_hint_to_schema` only unwrapped `typing.Union`, so `X | None` fell through
+  to `string`: `mineai_call_tool.options` is now `object` and
+  `mineai_list_tools.names` is `array` (`items: string` — a scalar element
+  type is declared). Bare `list` / `dict` hints map to `array` / `object`.
+- **Tool descriptions are the whole docstring**, not its first paragraph, so
+  the guidance after the summary reaches the model (`remediation`,
+  `retryable`, `replayed`, `_compaction`, `options.full`).
+  `@tool(description="…")` overrides the docstring. The two proxy docstrings
+  were rewritten as model-facing instructions: `mineai_call_tool` 107 → 693
+  bytes, `mineai_list_tools` 94 → 319 bytes.
+- **Honest `agent_image.attached`.** Only the Anthropic translator carries
+  `ToolResult.images`; on OpenRouter / OpenAI / Google the image was dropped
+  while the result said `attached: true`. `ark.provider.
+  carries_tool_result_images(provider_type)` states which paths carry
+  images; the proxy skill now skips the fetch on the others and returns
+  `agent_image: {attached: false, note: "<one-line reason>"}`.
+
 ## Unreleased — share_with_client no longer poisons the conversation
 
 `share_with_client` appends its `SharedFile` row from inside the tool call,

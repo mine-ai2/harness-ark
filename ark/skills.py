@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import sys
+import types
 import typing
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,18 +31,27 @@ from .types import ToolSchema
 _TOOL_ATTR = "__ark_tool_schema__"
 
 
-def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorate a function as a skill tool.
+def tool(
+    fn: Callable[..., Any] | None = None, *, description: str | None = None
+) -> Any:
+    """Decorate a function as a skill tool — `@tool` or `@tool(description=…)`.
 
-    The tool name is the function name. The schema is derived from type hints
-    and the docstring (first paragraph used as description).
+    The tool name is the function name. The schema is derived from type hints.
+    The description is the WHOLE docstring (dedented) — every paragraph is
+    guidance the model reads before calling the tool — unless `description`
+    overrides it.
     """
 
-    setattr(fn, _TOOL_ATTR, _build_schema(fn))
-    return fn
+    def decorate(f: Callable[..., Any]) -> Callable[..., Any]:
+        setattr(f, _TOOL_ATTR, _build_schema(f, description=description))
+        return f
+
+    if fn is not None:
+        return decorate(fn)
+    return decorate
 
 
-def _build_schema(fn: Callable[..., Any]) -> ToolSchema:
+def _build_schema(fn: Callable[..., Any], *, description: str | None = None) -> ToolSchema:
     sig = inspect.signature(fn)
     try:
         hints = typing.get_type_hints(fn)
@@ -56,31 +66,45 @@ def _build_schema(fn: Callable[..., Any]) -> ToolSchema:
         properties[pname] = _hint_to_schema(hint)
         if param.default is inspect.Parameter.empty:
             required.append(pname)
-    doc = (fn.__doc__ or "").strip()
-    description = doc.split("\n\n", 1)[0].strip() if doc else ""
+    if description is None:
+        # The full docstring, not its first paragraph (mine-capstone#1419):
+        # the paragraphs after the summary carry the usage rules.
+        description = inspect.cleandoc(fn.__doc__) if fn.__doc__ else ""
     schema_obj: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         schema_obj["required"] = required
-    return ToolSchema(name=fn.__name__, description=description, input_schema=schema_obj)
+    return ToolSchema(
+        name=fn.__name__, description=description.strip(), input_schema=schema_obj
+    )
+
+
+_SCALAR_SCHEMAS: dict[Any, str] = {
+    str: "string", int: "integer", float: "number", bool: "boolean",
+}
 
 
 def _hint_to_schema(hint: Any) -> dict[str, Any]:
     origin = get_origin(hint)
-    if origin is Union:
+    # `Optional[X]` / `Union[X, None]` (typing.Union) and the PEP 604 spelling
+    # `X | None` (types.UnionType) both unwrap to X.
+    if origin is Union or origin is types.UnionType:
         non_none = [a for a in get_args(hint) if a is not type(None)]  # noqa: E721
         if len(non_none) == 1:
             return _hint_to_schema(non_none[0])
-    if hint is str or hint is None:
         return {"type": "string"}
-    if hint is int:
-        return {"type": "integer"}
-    if hint is float:
-        return {"type": "number"}
-    if hint is bool:
-        return {"type": "boolean"}
-    if origin in (list, tuple, set):
-        return {"type": "array"}
-    if origin is dict:
+    if hint is None:
+        return {"type": "string"}
+    if hint in _SCALAR_SCHEMAS:
+        return {"type": _SCALAR_SCHEMAS[hint]}
+    if hint in (list, tuple, set) or origin in (list, tuple, set):
+        schema: dict[str, Any] = {"type": "array"}
+        args = [a for a in get_args(hint) if a is not Ellipsis]
+        # A scalar element type is declared (some providers reject an array
+        # schema without `items`); anything richer stays open.
+        if args and all(a is args[0] for a in args) and args[0] in _SCALAR_SCHEMAS:
+            schema["items"] = {"type": _SCALAR_SCHEMAS[args[0]]}
+        return schema
+    if hint is dict or origin is dict:
         return {"type": "object"}
     return {"type": "string"}
 

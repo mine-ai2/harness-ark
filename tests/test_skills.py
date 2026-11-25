@@ -120,3 +120,82 @@ def test_list_skills_marks_loaded(ark_home, tmp_path):
     assert err is False
     assert "a [loaded]" in output
     assert "b —" in output and "b [loaded]" not in output
+
+
+# ---------------------------------------------------------------------------
+# Schema generation (mine-capstone#1419)
+# ---------------------------------------------------------------------------
+
+
+def test_hint_to_schema_handles_pep604_unions():
+    from typing import Optional, Union
+
+    from ark.skills import _hint_to_schema
+
+    # `X | None` is types.UnionType, not typing.Union — both must unwrap.
+    assert _hint_to_schema(dict[str, object] | None) == {"type": "object"}
+    assert _hint_to_schema(Optional[dict[str, object]]) == {"type": "object"}
+    assert _hint_to_schema(Union[dict, None]) == {"type": "object"}
+    assert _hint_to_schema(list[str] | None) == {
+        "type": "array", "items": {"type": "string"},
+    }
+    assert _hint_to_schema(int | None) == {"type": "integer"}
+    assert _hint_to_schema(str | None) == {"type": "string"}
+    # A real multi-type union has no single JSON type: stays a string.
+    assert _hint_to_schema(int | str) == {"type": "string"}
+    # Open element types declare no `items`.
+    assert _hint_to_schema(list[dict]) == {"type": "array"}
+    assert _hint_to_schema(list) == {"type": "array"}
+
+
+def test_string_annotations_with_pep604_unions_resolve():
+    """Skill modules use `from __future__ import annotations` or quoted
+    hints; the resolved hint is a types.UnionType."""
+    from ark.skills import _TOOL_ATTR, tool
+
+    @tool
+    def f(a: "dict[str, object] | None" = None, b: "list[str] | None" = None) -> str:
+        """Doc."""
+        return ""
+
+    props = getattr(f, _TOOL_ATTR).input_schema["properties"]
+    assert props["a"] == {"type": "object"}
+    assert props["b"] == {"type": "array", "items": {"type": "string"}}
+
+
+def test_tool_description_is_the_full_docstring():
+    from ark.skills import _TOOL_ATTR, tool
+
+    @tool
+    def f(x: str) -> str:
+        """Summary line.
+
+        Second paragraph: read `error.remediation`.
+            Indented detail survives dedenting.
+        """
+        return x
+
+    description = getattr(f, _TOOL_ATTR).description
+    assert description.startswith("Summary line.\n\nSecond paragraph")
+    assert "error.remediation" in description
+    assert "\n    Indented detail" in description
+    assert not description.endswith("\n")
+
+
+def test_tool_description_override_and_call_form():
+    from ark.skills import _TOOL_ATTR, tool
+
+    @tool(description="Short model-facing text.")
+    def f(x: str) -> str:
+        """Long maintainer notes that the model should not read."""
+        return x
+
+    @tool()
+    def g() -> str:
+        """Doc g."""
+        return ""
+
+    assert getattr(f, _TOOL_ATTR).description == "Short model-facing text."
+    assert getattr(f, _TOOL_ATTR).name == "f"
+    assert getattr(g, _TOOL_ATTR).description == "Doc g."
+    assert f("a") == "a"

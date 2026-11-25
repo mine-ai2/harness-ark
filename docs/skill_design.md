@@ -72,7 +72,10 @@ before deciding whether to load it. Be specific.
 docstring. The decorator:
 
 - Uses the **function name** as the tool name.
-- Uses the **first paragraph of the docstring** as the tool description.
+- Uses the **whole docstring** (dedented) as the tool description — every
+  paragraph is guidance the model reads, so write it as instructions and keep
+  changelog notes in comments. `@tool(description="…")` overrides the
+  docstring.
 - Walks **type hints** to build the input schema.
 - Marks parameters without defaults as `required`.
 
@@ -84,9 +87,9 @@ Supported type → JSON schema mappings ([ark/skills.py:_hint_to_schema](../ark/
 | `int` | `integer` |
 | `float` | `number` |
 | `bool` | `boolean` |
-| `list[...]`, `tuple[...]`, `set[...]` | `array` |
+| `list[...]`, `tuple[...]`, `set[...]` | `array` (with `items` when the element type is a scalar, e.g. `list[str]`) |
 | `dict[...]` | `object` |
-| `Optional[T]` / `T \| None` | mapping of `T`, not in `required` |
+| `Optional[T]` / `Union[T, None]` / `T \| None` (PEP 604) | mapping of `T`, not in `required` |
 | anything else | `string` |
 
 Per-argument descriptions aren't extracted from docstrings yet. If you want

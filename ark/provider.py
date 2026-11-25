@@ -526,6 +526,19 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict[str, A
     return out
 
 
+# Provider types whose message translator carries `ToolResult.images` to the
+# model as real image blocks. `to_openai_messages` (OpenAI and OpenRouter) and
+# `to_google_contents` send a tool result's text only, so a skill must not
+# tell the model an image is attached on those paths (mine-capstone#1419).
+TOOL_RESULT_IMAGE_PROVIDER_TYPES = frozenset({"anthropic"})
+
+
+def carries_tool_result_images(provider_type: str) -> bool:
+    """True when a tool result's attached images reach the model on this
+    provider path."""
+    return provider_type in TOOL_RESULT_IMAGE_PROVIDER_TYPES
+
+
 def to_openai_tool(t: ToolSchema) -> dict[str, Any]:
     return {
         "type": "function",
