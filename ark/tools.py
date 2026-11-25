@@ -260,11 +260,33 @@ _register(
 # ---------------------------------------------------------------------------
 
 
+# search_web provider -> the vendor block that holds its API key.
+_SEARCH_VENDOR_BLOCKS = {"brave": "brave_search", "tavily": "tavily"}
+
+
+def _search_web_provider(tools_cfg: dict) -> str:
+    search_cfg = tools_cfg.get("search_web") or {}
+    return (search_cfg.get("provider") or "brave").lower()
+
+
+def search_web_readiness(tools_cfg: dict | None) -> dict:
+    """Operator-facing readiness of `search_web` (GET /tools/readiness).
+
+    Config only — no network call, no credit spend, and never the key
+    itself: `configured` is true when the selected provider's vendor block
+    carries a non-empty `api_key`.
+    """
+    tools_cfg = tools_cfg or {}
+    provider = _search_web_provider(tools_cfg)
+    block = _SEARCH_VENDOR_BLOCKS.get(provider)
+    api_key = (tools_cfg.get(block) or {}).get("api_key") if block else None
+    return {"configured": bool(api_key), "provider": provider}
+
+
 async def _search_web(*, query: str, count: int = 10) -> str:
     ctx = current_context()
     tools_cfg = ctx.config.tools or {}
-    search_cfg = tools_cfg.get("search_web") or {}
-    provider = (search_cfg.get("provider") or "brave").lower()
+    provider = _search_web_provider(tools_cfg)
     if provider == "brave":
         return await _search_web_brave(tools_cfg, query, count)
     if provider == "tavily":
