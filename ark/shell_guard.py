@@ -371,3 +371,5 @@ def detach_reason(command: str) -> str | None:
         return _scan(command)
     except _Unparseable:
         return None
+    except Exception:  # noqa: BLE001 — a scanner bug must not brick run_command
+        return None

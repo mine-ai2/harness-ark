@@ -89,3 +89,15 @@ def test_detaching_commands_are_named(command, names):
     reason = detach_reason(command)
     assert reason is not None, command
     assert names in reason
+
+
+def test_scanner_failure_lets_the_command_through(monkeypatch):
+    """The guard fails open: a bug in the scan must not turn every
+    run_command into an error."""
+    from ark import shell_guard
+
+    def boom(*_a, **_k):
+        raise RuntimeError("scanner bug")
+
+    monkeypatch.setattr(shell_guard, "_scan", boom)
+    assert shell_guard.detach_reason("setsid sleep 9 &") is None
