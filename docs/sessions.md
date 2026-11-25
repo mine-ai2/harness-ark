@@ -203,7 +203,7 @@ right session.
 | `injected_message` | `from_session_id`, `text` | Another session injected a message via `post_to_session` |
 | `user_message_injected` | `client_message_id`, `text` | A `user_message` sent while this session's turn was running was just added to the model's history (after a tool-results batch, before the next provider call). See [Mid-turn input](#mid-turn-input). |
 | `error` | `code`, `message` | Classified failure. `code` is one of `context_too_long`, `rate_limit`, `auth`, `other`. The runtime persists the same error as a `RunError` message in history. |
-| `done` | `stop_reason`, `undelivered`? | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`; after `stop`, `stopped: true` and `stop_reason: "stopped"`. `undelivered` (omitted when empty) lists mid-turn messages that never reached the model: `[{"client_message_id", "text"}]`. |
+| `done` | `stop_reason`, `iterations`, `max_iterations`, `undelivered`? | Whole run-loop finished for that session, awaiting next user input. On classified errors, `stop_reason` is `"error:<code>"`; after `stop`, `stopped: true` and `stop_reason: "stopped"`; when the tool loop hit its ceiling, `stop_reason` is `"max_iterations"`. `iterations` is the number of provider calls the turn made and `max_iterations` the ceiling it ran under (so `iterations == max_iterations` on a capped turn). `undelivered` (omitted when empty) lists mid-turn messages that never reached the model: `[{"client_message_id", "text"}]`. |
 
 Every event also carries `session_id` and (except for the broad "error" case
 where the session couldn't be identified) `agent_name`.
@@ -238,7 +238,7 @@ another tool call, hit `max_iterations`, errored, or was stopped — are
 `error` frame) lists them in `undelivered`, and the client decides whether
 to send them as the next turn. A message that arrives after the turn has
 closed starts a new turn as usual. `GET /health` advertises the capability
-as `"features": ["mid_turn_input"]`.
+as `mid_turn_input` in its `features` list.
 
 ### Cross-session catch-up
 
@@ -354,11 +354,11 @@ and the `post_to_session` tool in [ark/tools.py](../ark/tools.py).
 
 ## Advisory model/effort overrides
 
-Two session-create metadata keys get runtime meaning (everything else in
+Three session-create metadata keys get runtime meaning (everything else in
 `metadata` stays opaque, surfaced to skills only):
 
 ```json
-{ "metadata": { "model": "moonshotai/kimi-k3", "effort": "high" } }
+{ "metadata": { "model": "moonshotai/kimi-k3", "effort": "high", "max_iterations": 48 } }
 ```
 
 - `model` — any provider model id; replaces the agent's configured model
@@ -369,6 +369,14 @@ Two session-create metadata keys get runtime meaning (everything else in
 - `effort` — `medium` (the baseline, explicit no-op) or `high` (output
   budget raised to 8192 tokens, tool-loop ceiling to 32 iterations).
   Presets only ever *raise* the agent's configured budgets.
+- `max_iterations` — a positive integer asking for a higher tool-loop
+  ceiling for this session's turns. Additive like `effort`: the turn runs
+  under the largest of the agent's configured `max_iterations`, the effort
+  preset and this value, clamped to the agent's `max_iterations_ceiling`
+  (default 64). It can never lower the configured value; non-integers and
+  values ≤ 0 are ignored. The ceiling a turn actually ran under comes back
+  as `done.max_iterations`. `GET /health` advertises the capability as
+  `max_iterations_override` in `features`.
 
 Absent or unrecognized values fall through to the agent's configuration —
 fully backward compatible; clients that send nothing are unaffected.

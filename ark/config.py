@@ -79,6 +79,13 @@ class AgentConfig:
     tool_result_keep_turns: int = 2
     tool_result_elide_over: int = 2048
     tool_result_max_bytes: int = 65536
+    # Tool-loop ceiling per user turn (mine-capstone#1423): how many provider
+    # calls one turn may make before it ends with stop_reason
+    # "max_iterations". A session may ask for more via
+    # `metadata.max_iterations` (or `effort: high`), but only ever RAISES this
+    # value, and never past max_iterations_ceiling.
+    max_iterations: int = 16
+    max_iterations_ceiling: int = 64
 
 
 @dataclass
@@ -278,6 +285,24 @@ def _agents(
                 raise ConfigError(f"agents.{name}.{key} must be a non-negative integer")
             return value
 
+        def _positive_int(key: str, default: int) -> int:
+            value = cfg.get(key, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ConfigError(f"agents.{name}.{key} must be a positive integer")
+            return value
+
+        max_iterations = _positive_int("max_iterations", 16)
+        # The ceiling defaults to 64 but never sits below the configured
+        # baseline, so `"max_iterations": 100` alone stays valid.
+        max_iterations_ceiling = _positive_int(
+            "max_iterations_ceiling", max(64, max_iterations)
+        )
+        if max_iterations_ceiling < max_iterations:
+            raise ConfigError(
+                f"agents.{name}.max_iterations_ceiling ({max_iterations_ceiling}) "
+                f"must be >= max_iterations ({max_iterations})"
+            )
+
         out[name] = AgentConfig(
             name=name,
             provider=provider,
@@ -292,5 +317,7 @@ def _agents(
             tool_result_keep_turns=_int_knob("tool_result_keep_turns", 2),
             tool_result_elide_over=_int_knob("tool_result_elide_over", 2048),
             tool_result_max_bytes=_int_knob("tool_result_max_bytes", 65536),
+            max_iterations=max_iterations,
+            max_iterations_ceiling=max_iterations_ceiling,
         )
     return out

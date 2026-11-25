@@ -535,15 +535,40 @@ def _session_overrides(
     open-ended — OpenRouter routes `vendor/model` strings we can't
     enumerate); a bad id fails the provider call and surfaces as the usual
     RunError. Everything else → the agent's configured model. Effort: only
-    the known preset names map; anything else is ignored."""
+    the known preset names map; anything else is ignored.
+
+    `metadata.max_iterations` (mine-capstone#1423) is additive like `effort`:
+    a positive int joins the returned preset as its `max_iterations` (the
+    larger of it and the effort preset's). It can only RAISE the turn's
+    tool-loop ceiling — `_resolve_max_iterations` takes the max with the
+    agent's configured value and clamps to the agent's
+    `max_iterations_ceiling`. Anything else (bools, strings, floats, <= 0)
+    is ignored."""
     meta = session_metadata(conn, session_id)
     model = agent.model
     requested = meta.get("model")
     if isinstance(requested, str) and requested.strip():
         model = requested.strip()
     effort = meta.get("effort")
-    preset = EFFORT_PRESETS.get(effort, {}) if isinstance(effort, str) else {}
+    preset = dict(EFFORT_PRESETS.get(effort, {})) if isinstance(effort, str) else {}
+    steps = meta.get("max_iterations")
+    if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0:
+        preset["max_iterations"] = max(preset.get("max_iterations", 0), steps)
     return model, preset
+
+
+def _resolve_max_iterations(
+    agent: AgentConfig, base: int | None, preset: dict[str, int]
+) -> int:
+    """The turn's effective tool-loop ceiling. `base` is the caller's explicit
+    value (tests, embedders) or None for the agent's configured
+    `max_iterations`. Session overrides (effort preset / metadata) only ever
+    raise it, and never past the agent's `max_iterations_ceiling` — the
+    ceiling bounds what a CLIENT may ask for, it never lowers the base."""
+    if base is None:
+        base = agent.max_iterations
+    ceiling = max(agent.max_iterations_ceiling, base)
+    return min(max(base, preset.get("max_iterations", 0)), ceiling)
 
 
 async def run_user_turn(
@@ -554,9 +579,13 @@ async def run_user_turn(
     session_id: str,
     user_text: str,
     provider_factory=None,
-    max_iterations: int = 16,
+    max_iterations: int | None = None,
 ) -> AsyncIterator[RuntimeEvent]:
-    """Persist the user message, then drive the model → tools → model loop."""
+    """Persist the user message, then drive the model → tools → model loop.
+
+    `max_iterations=None` (every production caller) means the agent's
+    configured `max_iterations`; see `_resolve_max_iterations` for how a
+    session may raise it."""
 
     # Late-bound default: resolve the module attribute at call time so tests
     # can inject a stub via `runtime.make_provider` (the def-time default
@@ -580,7 +609,7 @@ async def run_user_turn(
     # the table.
     model, effort_preset = _session_overrides(conn, session_id, agent)
     max_output_tokens = max(agent.max_tokens or 4096, effort_preset.get("max_tokens", 0))
-    max_iterations = max(max_iterations, effort_preset.get("max_iterations", 0))
+    max_iterations = _resolve_max_iterations(agent, max_iterations, effort_preset)
     context_window = models.context_window_for(
         model, agent.max_context_tokens if model == agent.model else None
     )
@@ -611,6 +640,9 @@ async def run_user_turn(
     # tells the model "shared <path> with the client (<n> bytes)".
     _llm_excluded = (SessionContext, TurnMetrics, RunError, SharedFile)
     for iteration in range(max_iterations):
+        # Provider calls this turn has started, for the terminal frame
+        # (`done.iterations`); the registry lets the stop path report it too.
+        _turn_steps[session_id] = (iteration + 1, max_iterations)
         if iteration:
             # Mid-turn input: messages the user sent while this turn was
             # running join the history here — after the previous
@@ -718,11 +750,19 @@ async def run_user_turn(
                     continue
                 append_message(conn, session_id, RunError(code=code, message=message))
                 yield RunErrorEvent(code=code, message=message)
-                yield RunEnd(stop_reason=f"error:{code}")
+                yield RunEnd(
+                    stop_reason=f"error:{code}",
+                    iterations=iteration + 1,
+                    max_iterations=max_iterations,
+                )
                 return
 
         if not pending_tool_calls:
-            yield RunEnd(stop_reason=last_stop_reason)
+            yield RunEnd(
+                stop_reason=last_stop_reason,
+                iterations=iteration + 1,
+                max_iterations=max_iterations,
+            )
             return
 
         # File tools run where the session's files actually live
@@ -757,7 +797,11 @@ async def run_user_turn(
             )
             yield ToolResultEvent(call_id=tc.id, output=output, is_error=is_error)
 
-    yield RunEnd(stop_reason="max_iterations")
+    yield RunEnd(
+        stop_reason="max_iterations",
+        iterations=max_iterations,
+        max_iterations=max_iterations,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +824,13 @@ _active_turns: dict[str, "asyncio.Task"] = {}
 # `undelivered` and cleared — the CLIENT decides whether to send it as the
 # next turn (Ark never auto-starts one).
 _turn_inboxes: dict[str, list[dict]] = {}
+
+
+# session_id -> (provider calls started, effective max_iterations) for the
+# turn in flight (mine-capstone#1423). Written by run_user_turn at the top of
+# each iteration; read by run_and_publish's stop path, which has no RunEnd to
+# take the numbers from; cleared when the turn closes.
+_turn_steps: dict[str, tuple[int, int]] = {}
 
 
 def turn_running(session_id: str) -> bool:
@@ -811,6 +862,7 @@ def _close_turn(session_id: str, task) -> list[dict]:
     instead of landing in an inbox nobody drains."""
     if task is not None and _active_turns.get(session_id) is task:
         del _active_turns[session_id]
+    _turn_steps.pop(session_id, None)
     return _drain_inbox(session_id)
 
 
@@ -869,7 +921,13 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
     if isinstance(evt, RunErrorEvent):
         return {"type": "error", "code": evt.code, "message": evt.message}
     if isinstance(evt, RunEnd):
-        return {"type": "done", "stop_reason": evt.stop_reason}
+        wire: dict = {"type": "done", "stop_reason": evt.stop_reason}
+        # Additive (mine-capstone#1423): present whenever the loop knows them.
+        if evt.iterations is not None:
+            wire["iterations"] = evt.iterations
+        if evt.max_iterations is not None:
+            wire["max_iterations"] = evt.max_iterations
+        return wire
     if isinstance(evt, UserMessageInjected):
         return {
             "type": "user_message_injected",
@@ -929,6 +987,9 @@ async def run_and_publish(
             "session_id": session_id,
             "agent_name": agent.name,
         }
+        steps = _turn_steps.get(session_id)
+        if steps is not None:
+            frame["iterations"], frame["max_iterations"] = steps
         undelivered = _close_turn(session_id, task)
         if undelivered:
             frame["undelivered"] = undelivered
@@ -954,3 +1015,4 @@ async def run_and_publish(
             # Unreachable in practice (every exit path above closes the
             # turn); never leave a stale inbox behind a dead turn.
             _turn_inboxes.pop(session_id, None)
+            _turn_steps.pop(session_id, None)

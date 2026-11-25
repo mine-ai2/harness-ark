@@ -65,8 +65,11 @@ def create_app(config: Config) -> FastAPI:
     def health():
         # `features` lets clients detect optional protocol capabilities
         # without version sniffing (mid_turn_input: a user_message sent
-        # while a turn runs is injected into it — see docs/sessions.md).
-        return {"ok": True, "features": ["mid_turn_input"]}
+        # while a turn runs is injected into it; max_iterations_override:
+        # session metadata `max_iterations` raises the tool-loop ceiling and
+        # `done` carries `iterations` / `max_iterations` — see
+        # docs/sessions.md). Additive: clients must ignore unknown entries.
+        return {"ok": True, "features": list(HEALTH_FEATURES)}
 
     @app.get("/agents")
     def list_agents():
@@ -931,6 +934,11 @@ def create_app(config: Config) -> FastAPI:
             broker.unsubscribe_all(queue)
 
     return app
+
+
+# Optional protocol capabilities advertised on GET /health. Append only —
+# deployed clients (mine-capstone's bridge) feature-detect on these names.
+HEALTH_FEATURES: tuple[str, ...] = ("mid_turn_input", "max_iterations_override")
 
 
 def _check_bearer(header: str, expected: str) -> bool:
