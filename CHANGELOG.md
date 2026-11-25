@@ -76,6 +76,29 @@ because retrying identical input can never help. It is matched after
 also unwrapped from the provider's stringified JSON body, so clients surface
 the human sentence instead of `Error code: 400 - {'error': {...}}`.
 
+## Unreleased — Talos persona: finish-or-ask, truth from tool results, identity
+
+- `deploy/agents/talos/session_context.md` rewritten (mine-capstone#1420,
+  owner decisions T3 / T7), 2,535 → 4,550 bytes:
+  - **Identity** — "Talos, built by MineAI"; never name the underlying model
+    or its vendor; asked directly: "a hosted model MineAI selects".
+  - **Finish or ask** — every turn ends in exactly one of three ways: the
+    result, a question (`chat.ask_user` when present), or writes parked for
+    approval. Never on a promise ("Let me…").
+  - **Truth from tool results** — a write is done only when a tool result
+    says so; quote the id.
+  - **Errors** — read `error.message` / `error.remediation`, correct once,
+    else ask; never repeat a denied or identical failing call.
+  - **Numbers** — totals via `run_command`, showing the rows.
+  - **Uploads** — read the bytes (`list_uploads`, `read_file`, `openpyxl`,
+    `pypdf`) before answering; never guess from a file name.
+  - The `run_command` foreground rule (mine-capstone#1418).
+  - Kept: the working-directory, `share_with_client`, documents,
+    `embed_block` and MineAI-tools sections.
+- `tests/test_talos_persona.py` pins the rules and the kept lines.
+- Applies on the next deploy (the file is copied to
+  `~/.ark/agents/talos/`); sessions pick it up on their next turn.
+
 ## Unreleased — one file root for project sessions + document libraries
 
 Tool execution in a **project-bound session** now runs in the PROJECT ROOT
