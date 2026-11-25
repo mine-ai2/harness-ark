@@ -138,6 +138,14 @@ def create_app(config: Config) -> FastAPI:
             )
         return {"ok": True}
 
+    @app.get("/tools/readiness")
+    def tools_readiness():
+        # Authenticated (unlike /health): which built-in tools have the
+        # deploy-time config they need, so an operator console can show it
+        # without spending a real call. Booleans and provider names only —
+        # never a key. Additive: clients treat a 404 as "older build".
+        return {"search_web": tools.search_web_readiness(config.tools)}
+
     @app.get("/agents/{name}/crons/{cron_id}/sessions")
     def list_cron_fires(name: str, cron_id: str, limit: int = 20):
         """List the past fires (sessions) of a specific cron entry, newest

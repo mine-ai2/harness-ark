@@ -43,6 +43,11 @@ jobs:
           deploy/render-config.sh deploy/config/config.json.tmpl > /tmp/rendered.json
           python3 -m json.tool /tmp/rendered.json > /dev/null
           ! grep -q '\${' /tmp/rendered.json
+          # Optional web-search keys (mine-capstone#1422): unset renders ""
+          # with the default provider; a Tavily-only env selects Tavily.
+          python3 -c 'import json; t = json.load(open("/tmp/rendered.json"))["tools"]; assert t["search_web"] == {"provider": "brave"} and t["brave_search"] == {"api_key": ""} and t["tavily"] == {"api_key": ""}, t'
+          TAVILY_API_KEY=dummy deploy/render-config.sh deploy/config/config.json.tmpl > /tmp/rendered-search.json
+          python3 -c 'import json; t = json.load(open("/tmp/rendered-search.json"))["tools"]; assert t["search_web"] == {"provider": "tavily"} and t["tavily"] == {"api_key": "dummy"}, t'
       - name: User-data render test
         # Same drift guard for the cloud-init template: renders through the
         # exact script provision.sh uses, must stay valid YAML, and only

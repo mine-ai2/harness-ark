@@ -20,6 +20,18 @@
 - `GET /health` → `{"ok": true, "features": ["mid_turn_input"]}`; the CLI
   viewer prints delivered / undelivered mid-turn messages.
 
+## Unreleased — web-search key plumbing + readiness
+
+- **Deploys can carry a search key** (mine-capstone#1422). The config
+  template renders `tools.search_web` / `tools.brave_search` /
+  `tools.tavily` from the optional `BRAVE_SEARCH_API_KEY` /
+  `TAVILY_API_KEY` environment secrets; `render-config.sh` gains
+  `OPTIONAL_VARS` (unset → `""`, feature off, deploy green) and picks the
+  provider from the key that is present. Owner step in `deploy/README.md`.
+- **`GET /tools/readiness`** (authenticated) →
+  `{"search_web": {"configured": bool, "provider": str}}` — config only, no
+  network call, never the key. `/health` is unchanged.
+
 ## Unreleased — context efficiency: named blocks, tool-result elision, prompt caching
 
 Port of the upstream context-efficiency PR

@@ -216,6 +216,7 @@ Still needed from the operator (never printed here):
   gh secret set OPENAI_API_KEY     --env $GH_ENV
   gh secret set MINEAI_GATEWAY_URL    --env $GH_ENV
   gh secret set MINEAI_GATEWAY_SECRET --env $GH_ENV
+  gh secret set TAVILY_API_KEY        --env $GH_ENV   # optional: web search (or BRAVE_SEARCH_API_KEY)
 
 Then deploy (push to main or workflow_dispatch talos-deploy) and smoke:
   ARK_AUTH_SECRET=... deploy/scripts/smoke.sh $FQDN

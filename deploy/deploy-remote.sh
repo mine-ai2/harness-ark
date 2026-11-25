@@ -9,7 +9,8 @@
 # argv (visible in `ps`) or in a file outside root-owned temp space. Blank
 # lines and #-comments are ignored; values must not contain newlines.
 # Required keys: ARK_AUTH_SECRET, OPENAI_API_KEY, OPENROUTER_API_KEY,
-# MINEAI_GATEWAY_URL, MINEAI_GATEWAY_SECRET. Optional: ARK_HOST, ARK_PORT.
+# MINEAI_GATEWAY_URL, MINEAI_GATEWAY_SECRET. Optional: ARK_HOST, ARK_PORT,
+# BRAVE_SEARCH_API_KEY / TAVILY_API_KEY (web search; blank = not configured).
 #
 # Never add `set -x` here: it would leak secret values into the workflow log.
 set -Eeuo pipefail

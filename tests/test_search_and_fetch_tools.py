@@ -345,3 +345,75 @@ async def test_search_web_unknown_provider(tmp_path):
     out, err = await tools.execute("search_web", {"query": "x"}, ctx=ctx)
     assert err is True
     assert "unknown search_web provider" in out
+
+
+# ---------------------------------------------------------------------------
+# search_web readiness (GET /tools/readiness — mine-capstone#1422)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tools_cfg, expected",
+    [
+        (None, {"configured": False, "provider": "brave"}),
+        ({}, {"configured": False, "provider": "brave"}),
+        # The deploy template renders an unset secret as "" — still "not configured".
+        (
+            {"search_web": {"provider": "brave"}, "brave_search": {"api_key": ""}, "tavily": {"api_key": ""}},
+            {"configured": False, "provider": "brave"},
+        ),
+        ({"brave_search": {"api_key": "BSA-x"}}, {"configured": True, "provider": "brave"}),
+        # A key for the provider that is NOT selected does not count.
+        (
+            {"search_web": {"provider": "brave"}, "tavily": {"api_key": "tvly-x"}},
+            {"configured": False, "provider": "brave"},
+        ),
+        (
+            {"search_web": {"provider": "Tavily"}, "tavily": {"api_key": "tvly-x"}},
+            {"configured": True, "provider": "tavily"},
+        ),
+        ({"search_web": {"provider": "bing"}}, {"configured": False, "provider": "bing"}),
+    ],
+)
+def test_search_web_readiness(tools_cfg, expected):
+    assert tools.search_web_readiness(tools_cfg) == expected
+
+
+def _readiness_client(tmp_path, tools_cfg):
+    from fastapi.testclient import TestClient
+
+    from ark.server import create_app
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cfg = Config(
+        server=ServerConfig(host="127.0.0.1", port=0, auth_secret="s3cret"),
+        providers={"anthropic": ProviderConfig(provider_type="anthropic", api_key="k")},
+        tools=tools_cfg,
+        agents={
+            "scribe": AgentConfig(
+                name="scribe", provider="anthropic", model="m", workspace=ws
+            )
+        },
+    )
+    return TestClient(create_app(cfg))
+
+
+def test_tools_readiness_endpoint_reports_search_without_the_key(ark_home, tmp_path):
+    client = _readiness_client(
+        tmp_path,
+        {"search_web": {"provider": "tavily"}, "tavily": {"api_key": "tvly-secret"}},
+    )
+    r = client.get("/tools/readiness", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
+    assert r.json() == {"search_web": {"configured": True, "provider": "tavily"}}
+    assert "tvly-secret" not in r.text
+
+
+def test_tools_readiness_endpoint_requires_auth_and_reports_unconfigured(ark_home, tmp_path):
+    client = _readiness_client(tmp_path, {})
+    assert client.get("/tools/readiness").status_code == 401
+    r = client.get("/tools/readiness", headers={"Authorization": "Bearer s3cret"})
+    assert r.json() == {"search_web": {"configured": False, "provider": "brave"}}
+    # /health stays the unauthenticated liveness contract, untouched.
+    assert client.get("/health").json()["ok"] is True

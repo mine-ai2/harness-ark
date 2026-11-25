@@ -193,6 +193,8 @@ Then render the config. Variables:
 | `OPENROUTER_API_KEY` | OpenRouter key (`providers.openrouter`; talos runs on `moonshotai/kimi-k3`) |
 | `MINEAI_GATEWAY_URL` | MineAI gateway endpoint (rendered into the `tools.mineai_gateway` passthrough) |
 | `MINEAI_GATEWAY_SECRET` | MineAI gateway credential |
+| `BRAVE_SEARCH_API_KEY` | *optional* — Brave Search key for the `search_web` tool (`tools.brave_search`) |
+| `TAVILY_API_KEY` | *optional* — Tavily key for `search_web` (`tools.tavily`); used when it is the only search key set |
 
 ```sh
 export ARK_HOST=127.0.0.1 ARK_PORT=7777 \
@@ -206,7 +208,9 @@ rm /tmp/config.json
 [render-config.sh](render-config.sh) owns the `envsubst` variable allowlist —
 add new template variables there and nowhere else. The explicit list keeps
 `envsubst` from touching any other `$`-looking content, and the script fails
-if any variable is unset instead of rendering it as `""`. The unrendered
+if any required variable is unset instead of rendering it as `""` (the
+`OPTIONAL_VARS` — the web-search keys — render as `""`, which leaves that
+feature off; see [Web search](#web-search)). The unrendered
 template is deliberately invalid JSON (`"port": ${ARK_PORT}` is unquoted),
 so deploying it unrendered fails loudly at config load instead of
 half-working.
@@ -233,7 +237,9 @@ settings → Environments, both with deployment-branch policy `main`:
 
 Per-environment **secrets**: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 `ARK_AUTH_SECRET`, `MINEAI_GATEWAY_URL`, `MINEAI_GATEWAY_SECRET`, `SSH_PRIVATE_KEY` (dedicated
-ed25519 deploy key per environment). Per-environment **variables**:
+ed25519 deploy key per environment), plus the optional web-search key
+(`TAVILY_API_KEY` or `BRAVE_SEARCH_API_KEY` — see [Web search](#web-search)).
+Per-environment **variables**:
 `DEPLOY_HOST` (droplet IP — SSH stays independent of DNS health),
 `DEPLOY_USER` (the `deploy` user below), `DEPLOY_DOMAIN` (the environment's
 FQDN, used by the post-deploy smoke test), `SSH_KNOWN_HOSTS` (output of
@@ -250,6 +256,37 @@ renders and validates the config **before** replacing the live one, syncs
 removed manually), restarts the unit, and fails the run unless `/health`
 returns 200. Secrets travel to the VM over ssh stdin only — never argv,
 never a persisted file — and the scripts never `set -x`.
+
+### Web search
+
+Talos's `search_web` tool needs a search-provider key. Without one the tool
+stays in the manifest but every call answers "requires … api_key", and the
+agent falls back to scraping a search engine's HTML through `fetch_url`
+(mine-capstone#1422). The key is **optional** for a deploy: an environment
+without it deploys green and reports "not configured".
+
+One secret per GitHub environment (`development`, `production`, and any
+per-customer `production-<c>`), whichever vendor you have an account with:
+
+```sh
+gh secret set TAVILY_API_KEY       --env <environment> -R mine-ai2/harness-ark   # https://app.tavily.com
+# or
+gh secret set BRAVE_SEARCH_API_KEY --env <environment> -R mine-ai2/harness-ark   # https://brave.com/search/api
+```
+
+Then re-run `talos-deploy` (`workflow_dispatch`, or the next push to `main`).
+[render-config.sh](render-config.sh) picks the provider from the key that is
+present — Tavily when it is the only one, otherwise Brave; export
+`SEARCH_WEB_PROVIDER=brave|tavily` to force it on a manual render. Verify:
+
+```sh
+curl -fsS -H "Authorization: Bearer $ARK_AUTH_SECRET" https://<domain>/tools/readiness
+# -> {"search_web": {"configured": true, "provider": "tavily"}}
+```
+
+`GET /tools/readiness` is authenticated, reads config only (no search is
+run, no credits spent) and never returns the key. MineAI's Admin →
+Environment page shows the same answer as the "Harness web search" row.
 
 **VM contract** (satisfied by cloud-init at provision time — see
 "Provisioning" above): a `deploy` user whose `authorized_keys` holds the

@@ -240,6 +240,12 @@ Recommendations:
 `GET /health` (no auth) returns `{"ok": true}`. Wire it into your
 load balancer / uptime monitor / `systemctl` health probe.
 
+`GET /tools/readiness` (bearer auth) reports whether built-in tools have
+the deploy-time config they need, without calling the vendor and without
+echoing any key: `{"search_web": {"configured": true, "provider": "tavily"}}`.
+`configured` is true when the selected `tools.search_web.provider`'s vendor
+block has a non-empty `api_key` (see [config.md](config.md)).
+
 ## Troubleshooting
 
 - **`no config at /root/.ark/config.json`** — `ARK_HOME` isn't pointing at
