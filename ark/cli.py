@@ -244,6 +244,10 @@ def _handle_event(ui: _Ui, evt: dict) -> None:
             ui.error_line(f"[rate limited by provider — try again shortly. {msg[:120]}]")
         elif code == "auth":
             ui.error_line(f"[auth failure — check your provider API key. {msg[:120]}]")
+        elif code == "upstream_unavailable":
+            ui.error_line(
+                f"[provider unavailable — retried and gave up; try again shortly. {msg[:120]}]"
+            )
         else:
             ui.error_line(f"[server error: {msg}]")
     elif t == "user_message_injected":

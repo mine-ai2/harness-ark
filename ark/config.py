@@ -29,6 +29,11 @@ class ProviderConfig:
     provider_type: str  # one of KNOWN_PROVIDER_TYPES
     api_key: str
     base_url: str | None = None
+    # Longest silence tolerated on a provider response before the request is
+    # abandoned (mine-capstone#1413) — on a stream, the gap between chunks.
+    # Applied to the OpenAI-compatible clients (openai / openrouter); a
+    # timeout before anything streamed is retried like a 5xx.
+    read_timeout_seconds: float = 120.0
 
 
 @dataclass
@@ -200,8 +205,20 @@ def _providers(raw: dict[str, Any]) -> dict[str, ProviderConfig]:
         base_url = cfg.get("base_url")
         if base_url is not None and not isinstance(base_url, str):
             raise ConfigError(f"providers.{name}.base_url must be a string")
+        read_timeout = cfg.get("read_timeout_seconds", 120.0)
+        if (
+            not isinstance(read_timeout, (int, float))
+            or isinstance(read_timeout, bool)
+            or read_timeout <= 0
+        ):
+            raise ConfigError(
+                f"providers.{name}.read_timeout_seconds must be a positive number"
+            )
         out[name] = ProviderConfig(
-            provider_type=ptype, api_key=cfg["api_key"], base_url=base_url
+            provider_type=ptype,
+            api_key=cfg["api_key"],
+            base_url=base_url,
+            read_timeout_seconds=float(read_timeout),
         )
     return out
 

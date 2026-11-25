@@ -76,6 +76,7 @@ Per-provider fields:
 |---|---|---|---|
 | `provider_type` | string | yes | One of `anthropic`, `openai`, `openrouter`, `google`. Determines which SDK and wire format to use. |
 | `api_key` | string | yes | The upstream API key. |
+| `read_timeout_seconds` | number | no | Longest silence tolerated on a response before the request is abandoned — on a stream, the gap between chunks. Default `120`. Applies to `openai` and `openrouter` entries (connect 10 s, write 30 s, pool 10 s are fixed); a timeout before anything streamed is retried like a 5xx. |
 | `base_url` | string | no | Override the default endpoint. Useful for proxies, Azure / Bedrock front-doors, self-hosted gateways, or pointing `openai` at any OpenAI-compatible service. OpenRouter's default is already set; only override if you need to. |
 
 Supported `provider_type` values:
