@@ -190,6 +190,11 @@ class ToolCallEvent:
     name: str
     input: dict[str, Any]
     thought_signature: bytes | None = None  # see ToolCall.thought_signature
+    # The provider's argument JSON was cut off by the output limit
+    # (mine-capstone#1413): `input` is `{}` because nothing parseable
+    # arrived. The turn loop answers with an error tool result instead of
+    # executing the tool with empty arguments.
+    truncated: bool = False
 
 
 @dataclass

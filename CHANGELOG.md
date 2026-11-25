@@ -20,6 +20,24 @@
 - `GET /health` → `{"ok": true, "features": ["mid_turn_input"]}`; the CLI
   viewer prints delivered / undelivered mid-turn messages.
 
+## Unreleased — provider resilience (mine-capstone#1413)
+
+- **`upstream_unavailable`** joins the classified provider error codes:
+  5xx, connection errors, read timeouts and OpenRouter's "Upstream idle
+  timeout exceeded" / "Provider returned error" envelopes (never a 4xx).
+  Like `rate_limit`, it is retried after 2 / 5 / 15 s when it arrives
+  before anything has streamed; once output has streamed there is no retry.
+- **Partial text survives a mid-stream failure**: the text already
+  streamed is saved as `AssistantText` before the `RunError` row.
+- **Read timeout**: the OpenAI / OpenRouter clients use
+  `httpx.Timeout(connect=10, read=120, write=30, pool=10)` instead of the
+  SDK's 600 s; `providers.<name>.read_timeout_seconds` overrides the read
+  leg.
+- **Truncated tool calls are not executed**: argument JSON cut off by the
+  output limit yields `tool_call {…, "truncated": true}` and an error
+  `tool_result` ("arguments truncated by the output limit — retry with a
+  smaller call") instead of running the tool with `{}`.
+
 ## Unreleased — context efficiency: named blocks, tool-result elision, prompt caching
 
 Port of the upstream context-efficiency PR

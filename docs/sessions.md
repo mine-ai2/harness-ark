@@ -196,7 +196,7 @@ right session.
 | `assistant_delta` | `text` | Streaming assistant text |
 | `assistant_message` | `text` | End of one provider turn |
 | `thinking` | `delta` | Extended-thinking text (Gemini/Anthropic) |
-| `tool_call` | `id`, `name`, `input` | Model invoked a tool |
+| `tool_call` | `id`, `name`, `input`, `truncated`? | Model invoked a tool. `truncated: true` (omitted otherwise) marks a call whose arguments were cut off by the output limit — it is answered with an error result, never executed. |
 | `tool_result` | `id`, `output`, `error` | Tool returned |
 | `turn_usage` | `input_tokens`, `output_tokens`, `model`, `context_window` | Per-turn token counts (`context_window` is null if unknown). See [Usage tracking](#usage-tracking) below. |
 | `file_available` | `path`, `description`, `size` | Agent shared a file (see [files.md](files.md)) |
@@ -328,7 +328,7 @@ session." Compaction / summarization is a separate piece of work.
 ## Error tracking
 
 Provider exceptions are caught inside `run_user_turn`, classified into one
-of four codes, persisted as a `RunError` message, and surfaced over the WS
+of these codes, persisted as a `RunError` message, and surfaced over the WS
 as an `error` event:
 
 | Code | Triggered by |
@@ -336,7 +336,23 @@ as an `error` event:
 | `context_too_long` | "context length exceeded" / "prompt is too long" / "input is too long" from any provider |
 | `rate_limit` | 429s, "rate limit" in the message, or a `RateLimit*` exception type |
 | `auth` | 401s, "authentication" / "invalid api key" in the message, or `Authentication*` exception types |
+| `bad_request` | 400s / `BadRequest*` exception types — the provider rejected what we sent; retrying identical input cannot help |
+| `upstream_unavailable` | The provider or the path to it failed: 5xx, connection errors, read timeouts (`providers.<name>.read_timeout_seconds`), OpenRouter's "Upstream idle timeout exceeded" / "Provider returned error" (never for a 4xx) |
 | `other` | Anything else |
+
+**Transient failures are retried before the first byte.** A `rate_limit`
+or `upstream_unavailable` failure that arrives before the provider has
+streamed anything is retried after 2 s, 5 s and 15 s; the fourth failure
+surfaces as the error. Once anything has streamed there is no retry (a
+replayed stream would double-emit to clients) — instead the text already
+streamed is saved as an `AssistantText` message *before* the `RunError`
+row, so history and the model's next turn keep what the user saw.
+
+**Truncated tool calls are not executed.** When the output limit cuts a
+tool call's argument JSON, the `tool_call` event carries `truncated: true`
+(with `input: {}`), the tool does not run, and its `tool_result` is an
+error: "arguments truncated by the output limit — retry with a smaller
+call".
 
 After an error, the run loop ends with `stop_reason: "error:<code>"`. The
 session is not deleted — history is fully readable and you can attempt

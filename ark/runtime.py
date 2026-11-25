@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -46,17 +47,32 @@ from .types import (
 # ---------------------------------------------------------------------------
 
 
-def make_provider(provider_type: str, *, api_key: str, base_url: str | None = None) -> Provider:
+def make_provider(
+    provider_type: str,
+    *,
+    api_key: str,
+    base_url: str | None = None,
+    read_timeout_seconds: float | None = None,
+) -> Provider:
+    """`read_timeout_seconds` (providers.<name>.read_timeout_seconds, default
+    120) reaches the OpenAI-compatible clients; the Anthropic and Google
+    adapters keep their SDK defaults."""
     if provider_type == "anthropic":
         return AnthropicProvider(api_key=api_key, base_url=base_url)
     if provider_type == "openai":
         from .provider import OpenAIProvider
 
-        return OpenAIProvider(api_key=api_key, base_url=base_url)
+        return OpenAIProvider(
+            api_key=api_key, base_url=base_url,
+            read_timeout_seconds=read_timeout_seconds,
+        )
     if provider_type == "openrouter":
         from .provider import OpenRouterProvider
 
-        return OpenRouterProvider(api_key=api_key, base_url=base_url)
+        return OpenRouterProvider(
+            api_key=api_key, base_url=base_url,
+            read_timeout_seconds=read_timeout_seconds,
+        )
     if provider_type == "google":
         from .provider import GoogleProvider
 
@@ -450,7 +466,7 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
     """Map a provider exception to (code, message) for client surfacing.
 
     Codes: 'context_too_long' | 'rate_limit' | 'auth' | 'bad_request' |
-    'other'. The match is intentionally loose — uses both exception class
+    'upstream_unavailable' | 'other'. The match is intentionally loose — uses both exception class
     name and message text so it works across Anthropic, OpenAI, OpenRouter
     (OpenAI-shaped), and Google without coupling to their import paths.
 
@@ -458,6 +474,12 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
     bucket — a malformed conversation, an unsupported parameter, a rejected
     tool schema. It is worth its own code because, unlike a rate limit, it is
     OUR bug and retrying identical input can never help.
+
+    ``upstream_unavailable`` is the opposite: the provider (or the network
+    path to it) failed — a 5xx, a connection error, a read/idle timeout, an
+    overloaded upstream. Nothing about the request was wrong, so it is
+    retried like a rate limit when nothing has streamed yet
+    (mine-capstone#1413).
     """
 
     name = type(exc).__name__
@@ -502,17 +524,84 @@ def classify_provider_error(exc: Exception) -> tuple[str, str]:
         or "request was rejected" in original_low
     ):
         return "bad_request", raw
+    # Checked LAST, and never for a 4xx: OpenRouter wraps a rejected request
+    # in the same "Provider returned error" envelope as a failed upstream, and
+    # only the status tells them apart. Retrying a 4xx cannot help.
+    if _CLIENT_STATUS_RE.search(original_low):
+        return "other", raw
+    if (
+        any(k in name for k in _UPSTREAM_ERROR_NAMES)
+        or any(k in original_low for k in _UPSTREAM_ERROR_PHRASES)
+        or _UPSTREAM_STATUS_RE.search(original_low)
+    ):
+        return "upstream_unavailable", raw
     return "other", raw
+
+
+# Exception class names (substring match, across the openai / anthropic /
+# google-genai / httpx / builtin families) that mean "the provider or the
+# path to it failed", never "our request was wrong".
+_UPSTREAM_ERROR_NAMES = (
+    "InternalServerError",   # openai / anthropic 5xx
+    "ServiceUnavailable",
+    "Overloaded",            # anthropic 529
+    "ServerError",           # google-genai 5xx
+    "APIConnectionError",    # openai / anthropic transport failure
+    "APITimeoutError",
+    "ReadTimeout",           # httpx
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "ReadError",
+    "RemoteProtocolError",   # peer closed mid-response
+    "TimeoutError",          # builtin / asyncio
+    "DeadlineExceeded",
+)
+# Message fragments, matched on the lowercased ORIGINAL string. "idle
+# timeout" / "provider returned error" are OpenRouter's wording for a failed
+# upstream (the two production failures behind mine-capstone#1413).
+_UPSTREAM_ERROR_PHRASES = (
+    "idle timeout",
+    "provider returned error",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "overloaded",
+    "connection error",
+    "timed out",
+    "peer closed connection",
+    "incomplete chunked read",
+)
+# A 5xx status as the SDKs print it: "Error code: 502", {"code": 503},
+# {'code': 500}, "status_code: 504", "HTTP 502".
+_STATUS_PREFIX = r"(?:error code:|status code:?|status_code[=:]|[\"']code[\"']:|http)\s*"
+# 408 (request timeout) is the one 4xx that is the upstream's doing.
+_UPSTREAM_STATUS_RE = re.compile(_STATUS_PREFIX + r"(?:5\d\d|408)\b")
+_CLIENT_STATUS_RE = re.compile(_STATUS_PREFIX + r"4(?!08)\d\d\b")
+
+# Provider error classes retried before the first streamed event.
+RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit", "upstream_unavailable"})
 
 
 # ---------------------------------------------------------------------------
 # Turn loop
 # ---------------------------------------------------------------------------
 
-# Backoff schedule for provider rate limits (mine-capstone#557): a 429 that
-# arrives before ANY event has streamed is retried after these sleeps; a
-# fourth strike (or any mid-stream 429) surfaces as the usual RunError.
+# Backoff schedule for transient provider failures: a 429 (mine-capstone#557)
+# or an unavailable upstream — 5xx, connection error, read/idle timeout
+# (mine-capstone#1413) — that arrives before ANY event has streamed is retried
+# after these sleeps; a fourth strike (or any mid-stream failure) surfaces as
+# the usual RunError.
 RATE_LIMIT_BACKOFF_SECONDS: tuple[float, ...] = (2.0, 5.0, 15.0)
+
+# Tool result for a call whose arguments were cut off by the output limit.
+TRUNCATED_TOOL_CALL_MESSAGE = (
+    "arguments truncated by the output limit — retry with a smaller call. "
+    "The tool was NOT executed: the argument JSON was cut off before it was "
+    "complete. Split the work into several smaller calls (fewer items or "
+    "shorter text per call)."
+)
 
 # Advisory per-session effort presets (mine-capstone#557/#568): clients may
 # put `effort: "medium" | "high"` in session-create metadata. `medium` IS
@@ -571,6 +660,7 @@ async def run_user_turn(
         provider_cfg.provider_type,
         api_key=provider_cfg.api_key,
         base_url=provider_cfg.base_url,
+        read_timeout_seconds=provider_cfg.read_timeout_seconds,
     )
     skills_for_session = loaded_skills(session_id)
     # Advisory per-session model/effort (mine-capstone#568): overrides come
@@ -643,6 +733,7 @@ async def run_user_turn(
 
         attempt = 0
         emitted_any = False
+        text_saved = False
         while True:
             try:
                 async for evt in provider.stream_turn(
@@ -688,6 +779,7 @@ async def run_user_turn(
                         last_stop_reason = evt.stop_reason
                         if turn_text:
                             append_message(conn, session_id, AssistantText(text=turn_text))
+                            text_saved = True
                         for tc in pending_tool_calls:
                             append_message(
                                 conn,
@@ -704,18 +796,28 @@ async def run_user_turn(
             except Exception as exc:  # noqa: BLE001
                 code, message = classify_provider_error(exc)
                 if (
-                    code == "rate_limit"
+                    code in RETRYABLE_PROVIDER_CODES
                     and not emitted_any
                     and attempt < len(RATE_LIMIT_BACKOFF_SECONDS)
                 ):
-                    # Provider throttled before anything reached the client
-                    # (mine-capstone#557 CP2: DO serverless 429s were failing
-                    # whole turns): absorb with backoff instead of surfacing
-                    # an error. Never retried once output has streamed — a
-                    # replayed stream would double-emit to the client.
+                    # Provider throttled or unavailable before anything
+                    # reached the client (mine-capstone#557 CP2: DO serverless
+                    # 429s; #1413: OpenRouter 5xx / "Upstream idle timeout
+                    # exceeded" were failing whole turns): absorb with backoff
+                    # instead of surfacing an error. Never retried once output
+                    # has streamed — a replayed stream would double-emit to
+                    # the client.
                     await asyncio.sleep(RATE_LIMIT_BACKOFF_SECONDS[attempt])
                     attempt += 1
                     continue
+                if turn_text and not text_saved:
+                    # Mid-stream failure: the client already rendered this
+                    # text delta by delta. Persist it BEFORE the error row so
+                    # history (and the model's next turn) holds what the user
+                    # saw instead of losing it (mine-capstone#1413). Tool
+                    # calls from the broken stream are NOT kept — a ToolCall
+                    # without its ToolResult would poison the history.
+                    append_message(conn, session_id, AssistantText(text=turn_text))
                 append_message(conn, session_id, RunError(code=code, message=message))
                 yield RunErrorEvent(code=code, message=message)
                 yield RunEnd(stop_reason=f"error:{code}")
@@ -741,7 +843,14 @@ async def run_user_turn(
             metadata=session_metadata(conn, session_id),
         )
         for tc in pending_tool_calls:
-            output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
+            if tc.truncated:
+                # The output limit cut the argument JSON (mine-capstone#1413).
+                # Running the tool with `{}` fails confusingly and the model
+                # retries the same oversized call, burning iterations — say
+                # what happened instead, and never execute.
+                output, is_error = TRUNCATED_TOOL_CALL_MESSAGE, True
+            else:
+                output, is_error = await tools.execute(tc.name, tc.input, ctx=ctx)
             images = None
             if not is_error:
                 # In-band image attachments (map.satellite) become first-class
@@ -848,7 +957,11 @@ def event_to_wire(evt: RuntimeEvent | Message) -> dict:
     if isinstance(evt, AssistantTurnEnd):
         return {"type": "assistant_message", "text": evt.text}
     if isinstance(evt, ToolCallEvent):
-        return {"type": "tool_call", "id": evt.id, "name": evt.name, "input": evt.input}
+        wire = {"type": "tool_call", "id": evt.id, "name": evt.name, "input": evt.input}
+        if evt.truncated:
+            # Additive: only present on a call the loop refused to execute.
+            wire["truncated"] = True
+        return wire
     if isinstance(evt, ToolResultEvent):
         return {
             "type": "tool_result",

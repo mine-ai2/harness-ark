@@ -11,6 +11,7 @@ import json
 from typing import Any, AsyncIterator, Iterable, Protocol
 
 import anthropic
+import httpx
 from google import genai
 from google.genai import types as gtypes
 from openai import AsyncOpenAI
@@ -316,16 +317,12 @@ def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderE
         # signature_delta and unknowns: ignore
     elif et == "content_block_stop":
         if state.block_type == "tool_use" and state.tool_id is not None:
-            parsed: dict[str, Any] = {}
-            if state.tool_json.strip():
-                try:
-                    parsed = json.loads(state.tool_json)
-                except json.JSONDecodeError:
-                    parsed = {}
+            parsed, truncated = _parse_tool_arguments(state.tool_json)
             yield ToolCallEvent(
                 id=state.tool_id,
                 name=state.tool_name or "",
                 input=parsed,
+                truncated=truncated,
             )
             state.tool_id = None
             state.tool_name = None
@@ -364,9 +361,49 @@ def _translate(event: Any, state: _State, model: str = "") -> Iterable[ProviderE
 # ---------------------------------------------------------------------------
 
 
+# Default read timeout for the OpenAI-compatible clients, in seconds
+# (mine-capstone#1413). The SDK default is 600 s, so a stalled upstream held a
+# turn for ten minutes; 120 s between chunks is generous for a healthy stream
+# (OpenRouter sends keep-alive comments while a model thinks).
+DEFAULT_READ_TIMEOUT_SECONDS = 120.0
+
+
+def provider_timeout(read_timeout_seconds: float | None = None) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=10.0,
+        read=float(read_timeout_seconds or DEFAULT_READ_TIMEOUT_SECONDS),
+        write=30.0,
+        pool=10.0,
+    )
+
+
+def _parse_tool_arguments(raw: str) -> tuple[dict[str, Any], bool]:
+    """Parse a streamed tool call's argument JSON → (arguments, truncated).
+
+    Empty arguments are a legitimate no-argument call. Text that does not
+    parse means the stream was cut mid-arguments (the output limit, in
+    practice): report it as truncated so the turn loop refuses to execute the
+    tool with `{}` (mine-capstone#1413)."""
+    if not raw.strip():
+        return {}, False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}, True
+    return parsed, False
+
+
 class OpenAIProvider:
-    def __init__(self, api_key: str, base_url: str | None = None) -> None:
-        kwargs: dict[str, Any] = {"api_key": api_key}
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str | None = None,
+        read_timeout_seconds: float | None = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "timeout": provider_timeout(read_timeout_seconds),
+        }
         if base_url:
             kwargs["base_url"] = base_url
         self._client = AsyncOpenAI(**kwargs)
@@ -421,8 +458,17 @@ class OpenRouterProvider(OpenAIProvider):
 
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
-    def __init__(self, api_key: str, base_url: str | None = None) -> None:
-        super().__init__(api_key=api_key, base_url=base_url or self.DEFAULT_BASE_URL)
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str | None = None,
+        read_timeout_seconds: float | None = None,
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url or self.DEFAULT_BASE_URL,
+            read_timeout_seconds=read_timeout_seconds,
+        )
 
     def _prepare_messages(
         self, system: str, messages: list[Message], *, model: str,
@@ -590,18 +636,20 @@ async def _translate_openai_stream(stream, model: str = "") -> AsyncIterator[Pro
         if choice.finish_reason:
             stop_reason = choice.finish_reason
 
-    for idx in sorted(tool_calls):
+    ordered = sorted(tool_calls)
+    for idx in ordered:
         slot = tool_calls[idx]
-        parsed: dict[str, Any] = {}
-        if slot["args"].strip():
-            try:
-                parsed = json.loads(slot["args"])
-            except json.JSONDecodeError:
-                parsed = {}
+        parsed, truncated = _parse_tool_arguments(slot["args"])
+        # A `length` finish means the output limit cut the stream while the
+        # LAST tool call was being written; if no argument bytes arrived at
+        # all there is nothing to fail parsing, but it is the same truncation.
+        if stop_reason == "length" and idx == ordered[-1] and not slot["args"].strip():
+            truncated = True
         yield ToolCallEvent(
             id=slot["id"] or f"call_{idx}",
             name=slot["name"] or "",
             input=parsed,
+            truncated=truncated,
         )
     yield TurnUsageEvent(
         input_tokens=input_tokens, output_tokens=output_tokens, model=model,
